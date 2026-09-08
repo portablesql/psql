@@ -11,6 +11,8 @@ func Count[T any](ctx context.Context, where any, opts ...*FetchOptions) (int, e
 	return Table[T]().Count(ctx, where, opts...)
 }
 
+// Count returns the number of records matching where (nil for all records).
+// See [Count].
 func (t *TableMeta[T]) Count(ctx context.Context, where any, opts ...*FetchOptions) (int, error) {
 	if t == nil {
 		return 0, ErrNotReady
@@ -18,12 +20,12 @@ func (t *TableMeta[T]) Count(ctx context.Context, where any, opts ...*FetchOptio
 	t.check(ctx)
 	opt := resolveFetchOpts(opts)
 
-	be := GetBackend(ctx)
-	req := B().Select(Raw("COUNT(1)")).From(t.FormattedName(be))
+	bt := t.bind(GetBackend(ctx))
+	req := B().Select(Raw("COUNT(1)")).From(bt.name)
 	if where != nil {
 		req = req.Where(where)
 	}
-	t.applySoftDelete(req, opt)
+	t.applySoftDelete(bt, req, opt)
 	req = req.Apply(opt.Scopes...)
 
 	// run query
@@ -34,6 +36,9 @@ func (t *TableMeta[T]) Count(ctx context.Context, where any, opts ...*FetchOptio
 	defer rows.Close()
 
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, err
+		}
 		// should not happen with COUNT(1)
 		return 0, os.ErrNotExist
 	}

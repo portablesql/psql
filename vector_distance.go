@@ -9,13 +9,13 @@ type VectorDistanceOp int
 
 const (
 	// VectorL2 is the L2 (Euclidean) distance operator.
-	// PostgreSQL/CockroachDB: <->   Fallback: vec_l2_distance()
+	// PostgreSQL/CockroachDB: <->   Display fallback: vec_l2_distance()
 	VectorL2 VectorDistanceOp = iota
 	// VectorCosine is the cosine distance operator.
-	// PostgreSQL/CockroachDB: <=>   Fallback: vec_cosine_distance()
+	// PostgreSQL/CockroachDB: <=>   Display fallback: vec_cosine_distance()
 	VectorCosine
 	// VectorInnerProduct is the negative inner product operator.
-	// PostgreSQL/CockroachDB: <#>   Fallback: vec_inner_product()
+	// PostgreSQL/CockroachDB: <#>   Display fallback: vec_inner_product()
 	VectorInnerProduct
 )
 
@@ -60,12 +60,17 @@ func (d *VectorDistance) String() string {
 	return d.EscapeValue()
 }
 
-// EscapeValue renders the distance expression without engine context (defaults to function syntax).
+// EscapeValue renders the distance expression without engine context, using a
+// vec_*_distance(field, vector) function call syntax. This is only a display
+// form: rendering a query through [QueryBuilder.Render] on an engine without
+// vector support returns an error instead.
 func (d *VectorDistance) EscapeValue() string {
 	return d.renderFunc(nil)
 }
 
 // escapeValueCtx renders the distance expression with engine-specific syntax.
+// Rendering for an engine whose dialect does not implement [VectorRenderer]
+// records an error on the context (the query fails to render).
 func (d *VectorDistance) escapeValueCtx(ctx *renderContext) string {
 	if ctx != nil {
 		if vr, ok := ctx.d.(VectorRenderer); ok {
@@ -73,6 +78,7 @@ func (d *VectorDistance) escapeValueCtx(ctx *renderContext) string {
 			vecExpr := escapeCtx(ctx, d.Vec.String())
 			return vr.VectorDistanceExpr(fieldExpr, vecExpr, d.Op)
 		}
+		ctx.errorf("psql: vector distance is not supported on %s", ctx.e)
 	}
 	return d.renderFunc(ctx)
 }
@@ -87,7 +93,7 @@ func (d *VectorDistance) sortEscapeValueCtx(ctx *renderContext) string {
 	return d.escapeValueCtx(ctx)
 }
 
-// renderFunc renders using function call syntax (fallback for non-PostgreSQL engines).
+// renderFunc renders using function call syntax (display fallback when no engine context is available).
 func (d *VectorDistance) renderFunc(ctx *renderContext) string {
 	b := &strings.Builder{}
 

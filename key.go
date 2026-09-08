@@ -9,13 +9,27 @@ import (
 
 var keyType = reflect.TypeFor[Key]()
 
-// Name allows specifying the table name when associating a table with a struct
+// Key declares a key or index on the table when embedded as a field of a
+// struct. The sql tag gives the key name (defaults to the field name), its
+// type (PRIMARY, UNIQUE, INDEX, FULLTEXT, SPATIAL, VECTOR; INDEX when omitted)
+// and the columns it spans, so composite keys are expressed with a
+// comma-separated, quoted fields list:
 //
-// For example:
-// type X struct {
-// KeyName psql.Key `sql:",type=UNIQUE,fields='A,B'"`
-// ...
-// }
+//	type Membership struct {
+//		UserID  uint64
+//		GroupID uint64
+//		Role    string   `sql:",type=VARCHAR,size=32"`
+//		PK      psql.Key `sql:"PRIMARY,type=PRIMARY,fields='UserID,GroupID'"`
+//		RoleIdx psql.Key `sql:",fields='Role'"`
+//	}
+//
+// Single-column keys can also be declared on the column itself with the key
+// attribute: `sql:",key=PRIMARY"` for the primary key, `sql:",key=UNIQUE:name"`
+// for a unique key called name, or `sql:",key=name"` for a plain index. Several
+// columns using the same key name form one composite key, in declaration order.
+//
+// Like [Name], a Key field also carries the row state used by [HasChanged] and
+// [Update] to detect which columns were modified since the object was loaded.
 type Key struct {
 	st *rowState
 }
@@ -29,12 +43,12 @@ func (k *Key) state() *rowState {
 
 // Key type constants for StructKey.Typ.
 const (
-	KeyPrimary  = 1
-	KeyUnique   = 2
-	KeyIndex    = 3
-	KeyFulltext = 4
-	KeySpatial  = 5
-	KeyVector   = 6
+	KeyPrimary  = 1 // PRIMARY KEY
+	KeyUnique   = 2 // UNIQUE index
+	KeyIndex    = 3 // plain INDEX (default)
+	KeyFulltext = 4 // FULLTEXT index
+	KeySpatial  = 5 // SPATIAL index
+	KeyVector   = 6 // vector similarity index
 )
 
 // StructKey holds metadata for a table key/index, including its type, column

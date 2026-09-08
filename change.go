@@ -1,28 +1,25 @@
 package psql
 
 import (
-	"fmt"
-	"log/slog"
 	"reflect"
 )
 
 // HasChanged returns true if the object has been modified since it was last loaded
 // from or saved to the database. It compares current field values against the stored
 // state from the last scan.
+//
+// Objects that carry no state (no psql.Name or psql.Key field), or that were
+// never loaded from nor saved to the database, are always reported as changed.
 func HasChanged[T any](obj *T) bool {
 	return Table[T]().HasChanged(obj)
 }
 
+// HasChanged reports whether obj differs from the values it had when it was
+// last scanned from, or written to, the database. See [HasChanged].
 func (t *TableMeta[T]) HasChanged(obj *T) bool {
 	st := t.rowstate(obj)
-	if st == nil {
-		// no main key → always report changed
-		slog.Warn(fmt.Sprintf("[psql] HasChanged but no state"), "event", "psql:change:state_missing", "table", t.table)
-		return true
-	}
-	if !st.init {
-		// uninitialized → no state
-		slog.Warn(fmt.Sprintf("[psql] HasChanged on non initialized value"), "event", "psql:change:state_uninit", "table", t.table)
+	if st == nil || !st.init {
+		// no state, or never loaded → always report changed
 		return true
 	}
 
@@ -30,12 +27,12 @@ func (t *TableMeta[T]) HasChanged(obj *T) bool {
 
 	for _, col := range t.fields {
 		// grab state value
-		stv, ok := st.val[col.Column]
+		stv, ok := st.val[col.Index]
 		if !ok {
 			// can't check because that column wasn't fetched → bad
 			return true
 		}
-		if !reflect.DeepEqual(val.Field(col.Index).Interface(), stv) {
+		if !stateEqual(col, val.Field(col.Index).Interface(), stv) {
 			return true
 		}
 	}

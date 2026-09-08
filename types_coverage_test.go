@@ -164,7 +164,7 @@ func TestCoverageIncrementDecrement(t *testing.T) {
 			Where(map[string]any{"id": int64(42)})
 		sql, err := q.Render(ctx)
 		require.NoError(t, err)
-		assert.Contains(t, sql, `"views"="views"+1`)
+		assert.Contains(t, sql, `"views"="views"+(1)`)
 	})
 
 	t.Run("Decrement", func(t *testing.T) {
@@ -173,7 +173,7 @@ func TestCoverageIncrementDecrement(t *testing.T) {
 			Where(map[string]any{"id": int64(1)})
 		sql, err := q.Render(ctx)
 		require.NoError(t, err)
-		assert.Contains(t, sql, `"stock"="stock"-5`)
+		assert.Contains(t, sql, `"stock"="stock"-(5)`)
 	})
 
 	t.Run("Increment by larger value", func(t *testing.T) {
@@ -182,7 +182,7 @@ func TestCoverageIncrementDecrement(t *testing.T) {
 			Where(map[string]any{"page": "home"})
 		sql, err := q.Render(ctx)
 		require.NoError(t, err)
-		assert.Contains(t, sql, `"hits"="hits"+100`)
+		assert.Contains(t, sql, `"hits"="hits"+(100)`)
 	})
 }
 
@@ -572,8 +572,8 @@ func TestCoverageUpdateWithMultipleSetTypes(t *testing.T) {
 		Where(map[string]any{"page": "index"})
 	sql, err := q.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, `"hits"="hits"+1`)
-	assert.Contains(t, sql, `"misses"="misses"-1`)
+	assert.Contains(t, sql, `"hits"="hits"+(1)`)
+	assert.Contains(t, sql, `"misses"="misses"-(1)`)
 	assert.Contains(t, sql, `"updated_at"=NOW()`)
 	assert.Contains(t, sql, `WHERE`)
 }

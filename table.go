@@ -4,12 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
-
-	"github.com/KarpelesLab/typutil"
 )
 
 var (
@@ -19,23 +16,42 @@ var (
 
 // TableView is a non-generic interface for accessing table metadata from
 // dialect implementations (which cannot use type parameters).
+//
+// The value handed to [SchemaChecker.CheckStructure] and
+// [Backend.CheckStructure] is already resolved against the backend's
+// [Namer]: AllFields, AllKeys, FieldByColumn and FieldStr report the column
+// names as they exist in that database.
 type TableView interface {
+	// TableName returns the table name as declared on the struct: the value of
+	// the psql.Name tag, or the Go type name.
 	TableName() string
+	// FormattedName returns the table name as used in SQL for the given backend.
 	FormattedName(be *Backend) string
+	// AllFields returns every column field of the table, in declaration order.
 	AllFields() []*StructField
+	// AllKeys returns every key/index declared on the table.
 	AllKeys() []*StructKey
+	// MainKey returns the primary key (or first unique key), or nil.
 	MainKey() *StructKey
+	// FieldByColumn returns the field for a column name, or nil.
 	FieldByColumn(col string) *StructField
+	// FieldStr returns the comma-separated, quoted column list used in SELECT.
 	FieldStr() string
+	// TableAttrs returns the attributes set on the psql.Name tag (e.g. check=0).
 	TableAttrs() map[string]string
+	// HasSoftDelete reports whether the table has a soft delete column.
 	HasSoftDelete() bool
 }
 
 // TableMeta holds the metadata for a registered table type T, including its fields,
 // keys, associations, and SQL column mappings. Obtain one via [Table].
+//
+// A TableMeta stores names as declared in Go. The table and column names
+// actually used against a database depend on that backend's [Namer]; see
+// [TableMeta.FormattedName].
 type TableMeta[T any] struct {
 	typ          reflect.Type
-	table        string // table name
+	table        string // declared table name: psql.Name value, or Go type name
 	explicitName bool   // true if table name was explicitly set via psql.Name
 	fields       []*StructField
 	fldcol       map[string]*StructField
@@ -47,17 +63,24 @@ type TableMeta[T any] struct {
 	futures      sync.Map
 	assocs       map[string]*assocMeta // association metadata by Go field name
 	softDelete   *StructField          // non-nil if soft delete is enabled
+	views        sync.Map              // *Backend → *boundTable (names resolved by the backend's Namer)
 }
 
+// TableMetaIntf is the non-generic interface satisfied by every [TableMeta].
 type TableMetaIntf interface {
+	// Name returns the declared table name (see [TableMeta.Name]).
 	Name() string
 }
 
 // Verify TableMeta implements TableView.
 var _ TableView = (*TableMeta[struct{}])(nil)
 
-// Table returns the table object for T against DefaultBackend unless the provided
-// ctx value has a backend.
+// Table returns the table metadata for the struct type T, registering it on
+// first use. Registration is safe for concurrent use: every caller receives
+// the same *TableMeta for a given T.
+//
+// Table panics if T is not a struct, has no column fields, or contains a field
+// whose type cannot be scanned from a database row.
 func Table[T any]() *TableMeta[T] {
 	typ := reflect.TypeFor[T]()
 
@@ -72,9 +95,26 @@ func Table[T any]() *TableMeta[T] {
 		return found.(*TableMeta[T])
 	}
 
+	info := buildTableMeta[T](typ)
+
+	tableMapL.Lock()
+	defer tableMapL.Unlock()
+	// another goroutine may have registered the same type while we were
+	// building ours: the first registration wins so that every caller shares
+	// one instance (and one row state layout).
+	if found, ok := tableMap[typ]; ok {
+		return found.(*TableMeta[T])
+	}
+	tableMap[typ] = info
+	return info
+}
+
+// buildTableMeta inspects typ and builds its metadata. It does not touch the
+// registry.
+func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 	info := &TableMeta[T]{
 		typ:    typ,
-		table:  FormatTableName(typ.Name()),
+		table:  typ.Name(),
 		fldcol: make(map[string]*StructField),
 		attrs:  make(map[string]string),
 		assocs: make(map[string]*assocMeta),
@@ -101,9 +141,8 @@ func Table[T any]() *TableMeta[T] {
 		}
 
 		col := finfo.Name
+		explicitCol := false
 		attrs := make(map[string]string)
-
-		// Column name transformations will happen at query time
 
 		tag := finfo.Tag.Get("sql")
 		if tag != "" {
@@ -117,6 +156,7 @@ func Table[T any]() *TableMeta[T] {
 				// could be sql:",type=..." so only set col if not empty
 				// Explicit tag name overrides the namer
 				col = tagCol
+				explicitCol = true
 			}
 			attrs = tagAttrs
 		}
@@ -169,6 +209,11 @@ func Table[T any]() *TableMeta[T] {
 			}
 		}
 
+		// "softdelete" only marks the field, it is not a column attribute and
+		// must not prevent type inference below.
+		_, softDelete := attrs["softdelete"]
+		delete(attrs, "softdelete")
+
 		if len(attrs) == 0 {
 			// import based on type
 			attrs["import"] = finfo.Type.String()
@@ -176,22 +221,28 @@ func Table[T any]() *TableMeta[T] {
 
 		var setter func(reflect.Value, sql.RawBytes) error
 		if attrs["format"] == "json" {
-			t := finfo.Type
-			for t.Kind() == reflect.Ptr {
-				t = t.Elem()
+			// format=json fields are (un)marshaled with encoding/json
+			jt := finfo.Type
+			for jt.Kind() == reflect.Ptr {
+				jt = jt.Elem()
 			}
-			setter = makeJSONSetter(t)
+			setter = makeJSONSetter(jt)
 		} else {
-			setter = findSetter(finfo.Type)
+			var err error
+			setter, err = lookupSetter(finfo.Type)
+			if err != nil {
+				panic(fmt.Sprintf("psql: cannot use field %s.%s as a column: %s", typ.Name(), finfo.Name, err))
+			}
 		}
 
 		fld := &StructField{
-			Index:  i,
-			Name:   finfo.Name,
-			Column: col,
-			setter: setter,
-			Attrs:  attrs,
-			Rattrs: make(map[Engine]map[string]string),
+			Index:       i,
+			Name:        finfo.Name,
+			Column:      col,
+			setter:      setter,
+			Attrs:       attrs,
+			Rattrs:      make(map[Engine]map[string]string),
+			explicitCol: explicitCol,
 		}
 		names = append(names, QuoteName(col))
 
@@ -204,7 +255,7 @@ func Table[T any]() *TableMeta[T] {
 		info.fldcol[fld.Column] = fld
 
 		// Detect soft delete: *time.Time field named "DeletedAt" or with softdelete attr
-		if _, ok := attrs["softdelete"]; ok || (finfo.Name == "DeletedAt" && finfo.Type == ptrTimeType) {
+		if softDelete || (finfo.Name == "DeletedAt" && finfo.Type == ptrTimeType) {
 			info.softDelete = fld
 		}
 	}
@@ -214,14 +265,12 @@ func Table[T any]() *TableMeta[T] {
 	}
 
 	info.fldStr = strings.Join(names, ",")
-
-	tableMapL.Lock()
-	tableMap[typ] = info
-	tableMapL.Unlock()
-
 	return info
 }
 
+// Name returns the table name as declared: the value of the psql.Name tag, or
+// the Go type name when no explicit name was given. The name used in SQL for
+// a given backend is returned by [TableMeta.FormattedName].
 func (t *TableMeta[T]) Name() string {
 	if t == nil {
 		return ""
@@ -229,12 +278,17 @@ func (t *TableMeta[T]) Name() string {
 	return t.table
 }
 
-// TableName returns the raw table name (implements TableView).
+// TableName returns the declared table name (implements TableView). It is the
+// same value as [TableMeta.Name].
 func (t *TableMeta[T]) TableName() string {
 	return t.table
 }
 
-// FormattedName returns the table name, applying the namer transformation if needed
+// FormattedName returns the table name used in SQL for the given backend.
+// Explicit names (psql.Name) are returned as-is; otherwise the Go type name is
+// passed once through the backend's [Namer].TableName. With the default
+// [LegacyNamer] "UserProfile" becomes "User_Profile"; with [DefaultNamer] it
+// stays "UserProfile".
 func (t *TableMeta[T]) FormattedName(be *Backend) string {
 	if t == nil {
 		return ""
@@ -247,7 +301,7 @@ func (t *TableMeta[T]) FormattedName(be *Backend) string {
 	return be.Namer().TableName(t.table)
 }
 
-// AllFields returns all fields (implements TableView).
+// AllFields returns all fields with their declared column names (implements TableView).
 func (t *TableMeta[T]) AllFields() []*StructField {
 	return t.fields
 }
@@ -262,7 +316,7 @@ func (t *TableMeta[T]) MainKey() *StructKey {
 	return t.mainKey
 }
 
-// FieldByColumn returns a field by its column name (implements TableView).
+// FieldByColumn returns a field by its declared column name (implements TableView).
 func (t *TableMeta[T]) FieldByColumn(col string) *StructField {
 	return t.fldcol[col]
 }
@@ -282,193 +336,56 @@ func (t *TableMeta[T]) HasSoftDelete() bool {
 	return t.softDelete != nil
 }
 
+// tableType returns the Go type this metadata describes.
+func (t *TableMeta[T]) tableType() reflect.Type {
+	return t.typ
+}
+
 func (t *TableMeta[T]) newobj() *T {
 	return reflect.New(t.typ).Interface().(*T)
 }
 
+// spawnAll scans every remaining row of rows into new objects and closes rows.
 func (t *TableMeta[T]) spawnAll(ctx context.Context, rows *sql.Rows) ([]*T, error) {
-	var res []*T
 	defer rows.Close()
 
+	plan, err := t.newScanPlan(ctx, rows)
+	if err != nil {
+		return nil, err
+	}
+
+	var res []*T
 	for rows.Next() {
 		obj := t.newobj()
-		err := t.scanValue(ctx, rows, obj)
-		if err != nil {
+		if err := plan.scan(ctx, rows, obj, true); err != nil {
 			return res, err
 		}
 		res = append(res, obj)
 	}
+	if err := rows.Err(); err != nil {
+		return res, err
+	}
 	return res, nil
 }
 
+// spawn scans the current row of rows into a new object.
 func (t *TableMeta[T]) spawn(ctx context.Context, rows *sql.Rows) (*T, error) {
-	// spawn an object based on the provided row
 	res := t.newobj()
-	err := t.scanValue(ctx, rows, res)
+	err := t.ScanTo(ctx, rows, res)
 	return res, err
 }
 
-func (t *TableMeta[T]) ScanTo(ctx context.Context, row *sql.Rows, v *T) error {
-	return t.scanValue(ctx, row, v)
-}
-
-func (t *TableMeta[T]) scanValue(ctx context.Context, rows *sql.Rows, target *T) error {
-	val := reflect.ValueOf(target).Elem()
-	st := t.rowstate(target)
-
-	// Make a slice for the values, and a reference interface slice
-	cols, err := rows.Columns()
+// ScanTo scans the current row of rows (rows.Next must already have been
+// called) into v, matching result columns to fields by column name, and
+// records the row state used by [TableMeta.HasChanged] and [TableMeta.Update].
+// The [AfterScanHook] is called if T implements it.
+//
+// When scanning many rows, prefer [Fetch], [Iter] or [SQLQueryT.Each]: they
+// resolve the column mapping once per result set instead of once per row.
+func (t *TableMeta[T]) ScanTo(ctx context.Context, rows *sql.Rows, v *T) error {
+	plan, err := t.newScanPlan(ctx, rows)
 	if err != nil {
 		return err
 	}
-	n := len(cols)
-
-	values := make([]sql.RawBytes, n)
-	scan := make([]interface{}, n)
-	for i := range values {
-		scan[i] = &values[i]
-	}
-
-	// scan
-	err = rows.Scan(scan...)
-	if err != nil {
-		slog.Error(fmt.Sprintf("scan err %s", err), "event", "psql:table:scan_error", "psql.table", t.table)
-		return fmt.Errorf("scan error: %w", err)
-	}
-
-	if st != nil {
-		st.init = true
-		st.val = make(map[string]any)
-	}
-
-	// perform set
-	for i := 0; i < n; i += 1 {
-		fld, ok := t.fldcol[cols[i]]
-		if !ok {
-			// maybe report this as a warning?
-			continue
-		}
-		f := val.Field(fld.Index)
-		// if nil, set to nil
-		if values[i] == nil {
-			if f.Kind() == reflect.Ptr {
-				if !f.IsNil() {
-					f.Set(reflect.Zero(f.Type()))
-				}
-			}
-			continue
-		}
-		// make sure "f" is a settable value (not a ptr), allocate if needed
-		for f.Kind() == reflect.Ptr {
-			if f.IsNil() {
-				f.Set(reflect.New(f.Type().Elem()))
-			}
-			f = f.Elem()
-		}
-		err = fld.setter(f, values[i])
-		if err != nil {
-			return fmt.Errorf("on field %s: %w", fld.Name, err)
-		}
-		if st != nil {
-			if fld.Attrs["format"] == "json" {
-				// Store raw JSON for state; DeepClone can't handle map[string]any
-				st.val[cols[i]] = string(values[i])
-			} else {
-				v := reflect.New(f.Type()).Elem()
-				vp := v
-				for vp.Kind() == reflect.Ptr {
-					if vp.IsNil() {
-						vp.Set(reflect.New(vp.Type().Elem()))
-					}
-					vp = vp.Elem()
-				}
-				fld.setter(vp, values[i])
-				st.val[cols[i]] = typutil.DeepClone(v.Interface())
-			}
-		}
-	}
-
-	if h, ok := any(target).(AfterScanHook); ok {
-		if err := h.AfterScan(ctx); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// scanValueReturning is like scanValue but skips AfterScanHook. Used for
-// RETURNING clauses where the scan is part of an INSERT/REPLACE, not a SELECT.
-func (t *TableMeta[T]) scanValueReturning(ctx context.Context, rows *sql.Rows, target *T) error {
-	val := reflect.ValueOf(target).Elem()
-	st := t.rowstate(target)
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-	n := len(cols)
-
-	values := make([]sql.RawBytes, n)
-	scan := make([]interface{}, n)
-	for i := range values {
-		scan[i] = &values[i]
-	}
-
-	err = rows.Scan(scan...)
-	if err != nil {
-		slog.Error(fmt.Sprintf("scan err %s", err), "event", "psql:table:scan_error", "psql.table", t.table)
-		return fmt.Errorf("scan error: %w", err)
-	}
-
-	if st != nil {
-		st.init = true
-		st.val = make(map[string]any)
-	}
-
-	for i := 0; i < n; i += 1 {
-		fld, ok := t.fldcol[cols[i]]
-		if !ok {
-			continue
-		}
-		f := val.Field(fld.Index)
-		if values[i] == nil {
-			if f.Kind() == reflect.Ptr {
-				if !f.IsNil() {
-					f.Set(reflect.Zero(f.Type()))
-				}
-			}
-			continue
-		}
-		for f.Kind() == reflect.Ptr {
-			if f.IsNil() {
-				f.Set(reflect.New(f.Type().Elem()))
-			}
-			f = f.Elem()
-		}
-		err = fld.setter(f, values[i])
-		if err != nil {
-			return fmt.Errorf("on field %s: %w", fld.Name, err)
-		}
-		if st != nil {
-			if fld.Attrs["format"] == "json" {
-				st.val[cols[i]] = string(values[i])
-			} else {
-				v := reflect.New(f.Type()).Elem()
-				vp := v
-				for vp.Kind() == reflect.Ptr {
-					if vp.IsNil() {
-						vp.Set(reflect.New(vp.Type().Elem()))
-					}
-					vp = vp.Elem()
-				}
-				fld.setter(vp, values[i])
-				st.val[cols[i]] = typutil.DeepClone(v.Interface())
-			}
-		}
-	}
-
-	// AfterScanHook is intentionally NOT called here since this is a
-	// RETURNING scan, not a user-initiated SELECT.
-	return nil
+	return plan.scan(ctx, rows, v, true)
 }

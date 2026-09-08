@@ -362,8 +362,8 @@ func TestBuilderCoverageLimitWithOffset(t *testing.T) {
 		query := psql.B().Select().From("users").Limit(10, 5)
 		sql, err := query.Render(ctx)
 		require.NoError(t, err)
-		// Default dialect uses MySQL-style LIMIT a, b
-		assert.Equal(t, `SELECT * FROM "users" LIMIT 10, 5`, sql)
+		// Limit(offset, count) renders LIMIT count OFFSET offset on every engine
+		assert.Equal(t, `SELECT * FROM "users" LIMIT 5 OFFSET 10`, sql)
 	})
 
 	t.Run("limit without offset", func(t *testing.T) {
@@ -589,7 +589,7 @@ func TestBuilderCoverageOrderByLimit(t *testing.T) {
 			Limit(20, 40)
 		sql, err := query.Render(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, `SELECT "id","name" FROM "users" ORDER BY "name" ASC LIMIT 20, 40`, sql)
+		assert.Equal(t, `SELECT "id","name" FROM "users" ORDER BY "name" ASC LIMIT 40 OFFSET 20`, sql)
 	})
 }
 

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 // StructField holds metadata for a single table field/column, including its
@@ -19,16 +20,44 @@ type StructField struct {
 	Nullable bool   // if a ptr or a kind of nullable value
 	Attrs    map[string]string
 	setter   func(v reflect.Value, from sql.RawBytes) error
-	Rattrs   map[Engine]map[string]string // resolved attrs
+	// Rattrs caches the attributes resolved per engine. It is guarded by an
+	// internal lock: read it through GetAttrs rather than directly.
+	Rattrs      map[Engine]map[string]string
+	rattrsLk    sync.Mutex
+	explicitCol bool // column name was given in the sql tag (namer does not apply)
 }
 
-// GetAttrs returns the fields' attrs for a given Engine, which can be cached for performance
+// clone returns a copy of f with an empty attribute cache.
+func (f *StructField) clone() *StructField {
+	return &StructField{
+		Index:       f.Index,
+		Name:        f.Name,
+		Column:      f.Column,
+		Nullable:    f.Nullable,
+		Attrs:       f.Attrs,
+		setter:      f.setter,
+		Rattrs:      make(map[Engine]map[string]string),
+		explicitCol: f.explicitCol,
+	}
+}
+
+// GetAttrs returns the fields' attrs for a given Engine. The result is
+// resolved once per engine and cached; it is safe for concurrent use.
 func (f *StructField) GetAttrs(be *Backend) map[string]string {
-	if r, ok := f.Rattrs[be.Engine()]; ok {
+	engine := be.Engine()
+
+	f.rattrsLk.Lock()
+	defer f.rattrsLk.Unlock()
+
+	if r, ok := f.Rattrs[engine]; ok {
 		return r
 	}
-	f.Rattrs[be.Engine()] = f.resolveAttrs(be, f.Attrs)
-	return f.Rattrs[be.Engine()]
+	if f.Rattrs == nil {
+		f.Rattrs = make(map[Engine]map[string]string)
+	}
+	r := f.resolveAttrs(be, f.Attrs)
+	f.Rattrs[engine] = r
+	return r
 }
 
 func (f *StructField) resolveAttrs(be *Backend, attrs map[string]string) map[string]string {
@@ -41,6 +70,9 @@ func (f *StructField) resolveAttrs(be *Backend, attrs map[string]string) map[str
 			res = f.resolveAttrs(be, parseAttrs(magic)) // recursive allowed
 		} else if magic, ok := magicTypes[f.Column+"+"+imp]; ok {
 			// found a magic type
+			res = f.resolveAttrs(be, parseAttrs(magic)) // recursive allowed
+		} else if magic, ok := magicTypes[f.Name+"+"+imp]; ok && f.Name != f.Column {
+			// found a magic type by Go field name
 			res = f.resolveAttrs(be, parseAttrs(magic)) // recursive allowed
 		} else if magic, ok := magicEngineTypes[be.Engine()][imp]; ok {
 			// found a magic type

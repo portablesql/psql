@@ -2,137 +2,104 @@ package psql
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
+	"reflect"
 )
 
 // FetchMapped fetches records and returns them as a map keyed by the string
-// representation of the given column. Each key maps to a single record (last wins
-// if duplicates exist).
+// representation of the given field. key may be a Go field name or a column
+// name; an unknown key returns [ErrUnknownField]. Each map entry holds a single
+// record (last wins if duplicates exist). All [FetchOptions] are honored as in
+// [Fetch].
 func FetchMapped[T any](ctx context.Context, where any, key string, opts ...*FetchOptions) (map[string]*T, error) {
 	return Table[T]().FetchMapped(ctx, where, key, opts...)
 }
 
+// FetchMapped fetches records matching where and maps them by key. See [FetchMapped].
 func (t *TableMeta[T]) FetchMapped(ctx context.Context, where any, key string, opts ...*FetchOptions) (map[string]*T, error) {
 	if t == nil {
 		return nil, ErrNotReady
 	}
-	t.check(ctx)
-	opt := resolveFetchOpts(opts)
-
-	// SELECT QUERY
-	be := GetBackend(ctx)
-	req := B().Select(Raw(t.fldStr)).From(t.FormattedName(be))
-	if where != nil {
-		req = req.Where(where)
-	}
-	t.applySoftDelete(req, opt)
-
-	if len(opt.Sort) > 0 {
-		req = req.OrderBy(opt.Sort...)
-	}
-
-	if opt.LimitCount > 0 {
-		if opt.LimitStart > 0 {
-			req = req.Limit(opt.LimitStart, opt.LimitCount)
-		} else {
-			req = req.Limit(opt.LimitCount)
-		}
-	}
-
-	if opt.Lock {
-		req.ForUpdate = true
-	}
-	req = req.Apply(opt.Scopes...)
-
-	// run query
-	rows, err := req.RunQuery(ctx)
+	final := make(map[string]*T)
+	err := t.fetchKeyed(ctx, "FetchMapped", where, key, opts, func(k string, v *T) {
+		final[k] = v
+	})
 	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:fetch_mapped:run_fail", "psql.table", t.table)
 		return nil, err
 	}
-	defer rows.Close()
-
-	final := make(map[string]*T)
-
-	for rows.Next() {
-		val, err := t.spawn(ctx, rows)
-		if err != nil {
-			return nil, err
-		}
-		st := t.rowstate(val)
-		if st == nil {
-			return nil, errors.New("object is not appropriate for FetchMapped")
-		}
-		// TODO avoid using fmt.Sprintf to convert value back to string
-		final[fmt.Sprintf("%v", st.val[key])] = val
-	}
-
 	return final, nil
 }
 
 // FetchGrouped fetches records and returns them grouped by the string
-// representation of the given column. Each key maps to a slice of matching records.
+// representation of the given field. key may be a Go field name or a column
+// name; an unknown key returns [ErrUnknownField]. Each map entry holds the
+// slice of matching records, in query order. All [FetchOptions] are honored as
+// in [Fetch].
 func FetchGrouped[T any](ctx context.Context, where map[string]any, key string, opts ...*FetchOptions) (map[string][]*T, error) {
 	return Table[T]().FetchGrouped(ctx, where, key, opts...)
 }
 
+// FetchGrouped fetches records matching where and groups them by key. See [FetchGrouped].
 func (t *TableMeta[T]) FetchGrouped(ctx context.Context, where any, key string, opts ...*FetchOptions) (map[string][]*T, error) {
 	if t == nil {
 		return nil, ErrNotReady
 	}
-	t.check(ctx)
-	opt := resolveFetchOpts(opts)
-
-	// SELECT QUERY
-	be := GetBackend(ctx)
-	req := B().Select(Raw(t.fldStr)).From(t.FormattedName(be))
-	if where != nil {
-		req = req.Where(where)
-	}
-	t.applySoftDelete(req, opt)
-
-	if len(opt.Sort) > 0 {
-		req = req.OrderBy(opt.Sort...)
-	}
-
-	if opt.LimitCount > 0 {
-		if opt.LimitStart > 0 {
-			req = req.Limit(opt.LimitStart, opt.LimitCount)
-		} else {
-			req = req.Limit(opt.LimitCount)
-		}
-	}
-
-	if opt.Lock {
-		req.ForUpdate = true
-	}
-	req = req.Apply(opt.Scopes...)
-
-	// run query
-	rows, err := req.RunQuery(ctx)
+	final := make(map[string][]*T)
+	err := t.fetchKeyed(ctx, "FetchGrouped", where, key, opts, func(k string, v *T) {
+		final[k] = append(final[k], v)
+	})
 	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:fetch_grouped:run_fail", "psql.table", t.table)
 		return nil, err
 	}
-	defer rows.Close()
+	return final, nil
+}
 
-	final := make(map[string][]*T)
+// fetchKeyed is the shared implementation of FetchMapped and FetchGrouped: it
+// validates key, runs the same query as Fetch and hands each record with its
+// key string to add.
+func (t *TableMeta[T]) fetchKeyed(ctx context.Context, op string, where any, key string, opts []*FetchOptions, add func(string, *T)) error {
+	t.check(ctx)
+	opt := resolveFetchOpts(opts)
+	bt := t.bind(GetBackend(ctx))
 
-	for rows.Next() {
-		val, err := t.spawn(ctx, rows)
-		if err != nil {
-			return nil, err
-		}
-		st := t.rowstate(val)
-		if st == nil {
-			return nil, errors.New("object is not appropriate for FetchGrouped")
-		}
-		// TODO avoid using fmt.Sprintf to convert value back to string
-		k := fmt.Sprintf("%v", st.val[key])
-		final[k] = append(final[k], val)
+	fld := t.fieldByNameOrColumn(bt, key)
+	if fld == nil {
+		return fmt.Errorf("%s: %w: %q is not a field or column of %s", op, ErrUnknownField, key, t.table)
 	}
 
-	return final, nil
+	req := t.selectQuery(bt, where, opt, true)
+
+	rows, err := req.RunQuery(ctx)
+	if err != nil {
+		logQueryError(ctx, "psql:"+op+":run_fail", t.table, "", err)
+		return err
+	}
+
+	final, err := t.spawnAll(ctx, rows) // closes rows
+	if err != nil {
+		return err
+	}
+
+	if len(opt.Preload) > 0 && len(final) > 0 {
+		if err := PreloadOpts(ctx, final, opt, opt.Preload...); err != nil {
+			return err
+		}
+	}
+
+	for _, val := range final {
+		add(keyString(reflect.ValueOf(val).Elem().Field(fld.Index)), val)
+	}
+	return nil
+}
+
+// keyString renders a field value as a map key, dereferencing pointers.
+func keyString(v reflect.Value) string {
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return "<nil>"
+		}
+		v = v.Elem()
+	}
+	// TODO avoid using fmt.Sprintf to convert value back to string
+	return fmt.Sprintf("%v", v.Interface())
 }

@@ -395,13 +395,13 @@ func TestByteSliceNotInWhere(t *testing.T) {
 func TestByteSliceNilInSet(t *testing.T) {
 	ctx := context.Background()
 
-	// nil []byte is treated as NULL (renders as IS NULL via escapeWhereSub's nil path)
+	// nil []byte is treated as NULL: SET clauses render an assignment, not a condition
 	query := psql.B().Update("files").
 		Set(map[string]any{"data": []byte(nil)}).
 		Where(map[string]any{"id": 1})
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, `"data" IS NULL`)
+	assert.Contains(t, sql, `"data"=NULL`)
 }
 
 func TestByteSliceEmptyInSet(t *testing.T) {

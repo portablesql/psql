@@ -241,7 +241,7 @@ func TestBuilderEmptyWhere(t *testing.T) {
 	query := psql.B().Select().From("users").Where(map[string]any{})
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, `SELECT * FROM "users" WHERE (1)`, sql)
+	assert.Equal(t, `SELECT * FROM "users" WHERE (TRUE)`, sql)
 }
 
 func TestBuilderChaining(t *testing.T) {

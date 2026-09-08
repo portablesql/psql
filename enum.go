@@ -3,6 +3,7 @@ package psql
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -118,21 +119,32 @@ func GenerateEnumCheckSQL(constraint *EnumConstraint, tableName string) string {
 		strings.Join(checks, " AND "))
 }
 
-// escapeEnumValue escapes single quotes in enum values
-func escapeEnumValue(value string) string {
-	// In PostgreSQL, a single quote is escaped by doubling it
-	return strings.ReplaceAll(value, "'", "''")
-}
-
-// sameEnumValues checks if two string slices contain the same values in the same order
-func sameEnumValues(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+// ValidateEnum checks that value is one of the values allowed by an enum
+// field (a field declared with type=enum,values='a,b,c'). It returns nil for
+// fields that are not enums. The error wraps [ErrInvalidEnumValue] so callers
+// can test for it with errors.Is. It is not called automatically yet; insert
+// and update paths may use it to reject invalid values before reaching the
+// database, where only PostgreSQL CHECK constraints would catch them.
+func ValidateEnum(field *StructField, value string) error {
+	if field == nil {
+		return nil
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	typ, ok := field.Attrs["type"]
+	if !ok || !strings.EqualFold(typ, "enum") {
+		return nil
+	}
+	values, ok := field.Attrs["values"]
+	if !ok {
+		return nil
+	}
+	for _, v := range strings.Split(values, ",") {
+		if v == value {
+			return nil
 		}
 	}
-	return true
+	return fmt.Errorf("%w: %q is not one of %s for column %s", ErrInvalidEnumValue, value, values, field.Column)
 }
+
+// ErrInvalidEnumValue is returned (wrapped) by [ValidateEnum] when a value is
+// not part of the allowed enum values.
+var ErrInvalidEnumValue = errors.New("invalid enum value")

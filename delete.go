@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"time"
 )
 
@@ -16,6 +15,9 @@ func Delete[T any](ctx context.Context, where any, opts ...*FetchOptions) (sql.R
 	return Table[T]().Delete(ctx, where, opts...)
 }
 
+// Delete removes (or soft deletes) the records matching where. Pass nil to
+// affect every record. [Limit] options are honored; query failures are
+// returned as an [*Error]. See [Delete].
 func (t *TableMeta[T]) Delete(ctx context.Context, where any, opts ...*FetchOptions) (sql.Result, error) {
 	if t == nil {
 		return nil, ErrNotReady
@@ -23,38 +25,26 @@ func (t *TableMeta[T]) Delete(ctx context.Context, where any, opts ...*FetchOpti
 	t.check(ctx)
 	opt := resolveFetchOpts(opts)
 
-	be := GetBackend(ctx)
+	bt := t.bind(GetBackend(ctx))
 
-	if t.softDelete != nil && !opt.HardDelete {
+	var req *QueryBuilder
+	event := "psql:delete:run_fail"
+	if bt.softDelete != nil && !opt.HardDelete {
 		// Soft delete: UPDATE SET DeletedAt = NOW()
-		req := B().Update(t.FormattedName(be)).
-			Set(map[string]any{t.softDelete.Column: time.Now()})
+		event = "psql:soft_delete:run_fail"
+		req = B().Update(bt.name).
+			Set(map[string]any{bt.softDelete.Column: time.Now()})
 		if where != nil {
 			req = req.Where(where)
 		}
 		// Only soft-delete records that aren't already deleted
-		req = req.Where(map[string]any{t.softDelete.Column: nil})
-
-		if opt.LimitCount > 0 {
-			if opt.LimitStart > 0 {
-				req = req.Limit(opt.LimitStart, opt.LimitCount)
-			} else {
-				req = req.Limit(opt.LimitCount)
-			}
+		req = req.Where(map[string]any{bt.softDelete.Column: nil})
+	} else {
+		// Hard delete
+		req = B().Delete().From(bt.name)
+		if where != nil {
+			req = req.Where(where)
 		}
-
-		res, err := req.ExecQuery(ctx)
-		if err != nil {
-			slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:soft_delete:run_fail", "psql.table", t.table)
-			return nil, err
-		}
-		return res, nil
-	}
-
-	// Hard delete
-	req := B().Delete().From(t.FormattedName(be))
-	if where != nil {
-		req = req.Where(where)
 	}
 
 	if opt.LimitCount > 0 {
@@ -65,10 +55,9 @@ func (t *TableMeta[T]) Delete(ctx context.Context, where any, opts ...*FetchOpti
 		}
 	}
 
-	// run query
-	res, err := req.ExecQuery(ctx)
+	res, err := execBuilder(ctx, req)
 	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:delete:run_fail", "psql.table", t.table)
+		logQueryError(ctx, event, t.table, "", err)
 		return nil, err
 	}
 	return res, nil
@@ -81,7 +70,13 @@ func DeleteOne[T any](ctx context.Context, where any, opts ...*FetchOptions) err
 	return Table[T]().DeleteOne(ctx, where, opts...)
 }
 
+// DeleteOne deletes exactly one record matching where inside its own
+// transaction, rolling back and returning [ErrDeleteBadAssert] if the number
+// of affected rows is not 1. See [DeleteOne].
 func (t *TableMeta[T]) DeleteOne(ctx context.Context, where any, opts ...*FetchOptions) error {
+	if t == nil {
+		return ErrNotReady
+	}
 	t.check(ctx)
 	tx, err := BeginTx(ctx, nil)
 	if err != nil {

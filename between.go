@@ -13,18 +13,11 @@ func Between(a, start, end any) EscapeValueable {
 }
 
 func (c *betweenComp) EscapeValue() string {
-	// A BETWEEN GTE AND LT
-	b := &strings.Builder{}
-	b.WriteString(Escape(c.a))
-	b.WriteString(" BETWEEN ")
-	b.WriteString(Escape(c.start))
-	b.WriteString(" AND ")
-	b.WriteString(Escape(c.end))
-	return b.String()
+	return c.escapeValueCtx(nil)
 }
 
 func (c *betweenComp) escapeValueCtx(ctx *renderContext) string {
-	// A Op B
+	// A BETWEEN start AND end
 	b := &strings.Builder{}
 	b.WriteString(escapeCtx(ctx, c.a))
 	b.WriteString(" BETWEEN ")
@@ -36,4 +29,8 @@ func (c *betweenComp) escapeValueCtx(ctx *renderContext) string {
 
 func (c *betweenComp) sortEscapeValue() string {
 	return c.EscapeValue()
+}
+
+func (c *betweenComp) sortEscapeValueCtx(ctx *renderContext) string {
+	return c.escapeValueCtx(ctx)
 }

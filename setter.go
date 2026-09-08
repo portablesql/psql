@@ -11,47 +11,58 @@ import (
 	"time"
 )
 
+// findSetter returns the scan function for values of type t, panicking if the
+// type is not supported. See lookupSetter for the supported types.
 func findSetter(t reflect.Type) func(v reflect.Value, from sql.RawBytes) error {
+	s, err := lookupSetter(t)
+	if err != nil {
+		panic("psql: " + err.Error())
+	}
+	return s
+}
+
+// lookupSetter returns the scan function for values of type t (pointers are
+// dereferenced). Supported are types implementing sql.Scanner, time.Time,
+// bool, string, all int and uint kinds, float32/64 and []byte.
+func lookupSetter(t reflect.Type) (func(v reflect.Value, from sql.RawBytes) error, error) {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 
-	if reflect.PtrTo(t).Implements(reflect.TypeFor[sql.Scanner]()) {
-		return scanSetter
+	if reflect.PointerTo(t).Implements(reflect.TypeFor[sql.Scanner]()) {
+		return scanSetter, nil
 	}
 
 	// most specific types
 	switch t {
 	case reflect.TypeFor[time.Time]():
-		return timeSetter
+		return timeSetter, nil
 	}
 
 	// fallbacks
 	switch t.Kind() {
 	case reflect.Bool:
-		return boolSetter
+		return boolSetter, nil
 	case reflect.String:
-		return stringSetter
-	case reflect.Int32:
-		return int32Setter
+		return stringSetter, nil
+	case reflect.Int8, reflect.Int16, reflect.Int32:
+		return int32Setter, nil
 	case reflect.Int64, reflect.Int:
-		return int64Setter
-	case reflect.Uint32:
-		return uint32Setter
+		return int64Setter, nil
+	case reflect.Uint8, reflect.Uint16, reflect.Uint32:
+		return uint32Setter, nil
 	case reflect.Uint64, reflect.Uint:
-		return uint64Setter
+		return uint64Setter, nil
 	case reflect.Float32:
-		return float32Setter
+		return float32Setter, nil
 	case reflect.Float64:
-		return float64Setter
+		return float64Setter, nil
 	case reflect.Slice:
 		if t.Elem().Kind() == reflect.Uint8 {
-			return bytesSetter
+			return bytesSetter, nil
 		}
-		panic(fmt.Sprintf("no setter for slice type %s", t))
-	default:
-		panic(fmt.Sprintf("no setter for type %s", t))
 	}
+	return nil, fmt.Errorf("unsupported type %s (supported: sql.Scanner implementations, time.Time, bool, string, int/uint kinds, float32/64, []byte, and pointers to these)", t)
 }
 
 func scanSetter(v reflect.Value, from sql.RawBytes) error {
@@ -83,7 +94,7 @@ func stringSetter(v reflect.Value, from sql.RawBytes) error {
 }
 
 func int32Setter(v reflect.Value, from sql.RawBytes) error {
-	n, err := strconv.ParseInt(string(from), 10, 32)
+	n, err := strconv.ParseInt(string(from), 10, v.Type().Bits())
 	if err != nil {
 		return err
 	}
@@ -92,7 +103,7 @@ func int32Setter(v reflect.Value, from sql.RawBytes) error {
 }
 
 func uint32Setter(v reflect.Value, from sql.RawBytes) error {
-	n, err := strconv.ParseUint(string(from), 10, 32)
+	n, err := strconv.ParseUint(string(from), 10, v.Type().Bits())
 	if err != nil {
 		return err
 	}

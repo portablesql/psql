@@ -5,9 +5,10 @@ import (
 	"unicode"
 )
 
-// FormatTableName is a variable that holds the default table name formatter.
-// It defaults to formatCamelSnakeCase but can be overridden.
-// This is kept for backwards compatibility - new code should use Backend.Namer.
+// FormatTableName is a variable that holds the table name formatter used by
+// [LegacyNamer]. It defaults to Camel_Snake_Case ("UserProfile" → "User_Profile")
+// but can be overridden. This is kept for backwards compatibility - new code
+// should configure a [Namer] on the Backend instead.
 var FormatTableName = formatCamelSnakeCase
 
 // format to Camel_Snake_Case

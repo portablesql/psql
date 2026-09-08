@@ -48,6 +48,12 @@ var magicTypes = map[string]string{
 	"psql.Vector":     "type=VECTOR,null=1",
 }
 
+// DefineMagicType registers a column definition that can be imported by name
+// (`sql:",import=NAME"`) or that applies automatically to Go fields of the
+// given type (e.g. "mypkg.MyType" or "*mypkg.MyType"); "Field+type" keys apply
+// to fields with that name and type. The definition uses the sql tag attribute
+// syntax, e.g. "type=CHAR,size=36,null=0". It panics if typ is already defined.
+// Call it during initialization, before tables are used.
 func DefineMagicType(typ string, definition string) {
 	if _, found := magicTypes[typ]; found {
 		panic(fmt.Sprintf("multiple definitions of type %s", typ))
@@ -55,6 +61,8 @@ func DefineMagicType(typ string, definition string) {
 	magicTypes[typ] = definition
 }
 
+// DefineMagicTypeEngine is like [DefineMagicType] but the definition only
+// applies on the given engine, taking precedence over the engine-independent one.
 func DefineMagicTypeEngine(e Engine, typ string, definition string) {
 	if magicEngineTypes[e] == nil {
 		magicEngineTypes[e] = make(map[string]string)

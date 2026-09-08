@@ -23,8 +23,7 @@ type subQueryTable struct {
 
 func (s *subQueryTable) EscapeTable() string {
 	// Fallback for non-context rendering
-	rctx := &renderContext{d: EngineMySQL.dialect()}
-	return s.escapeTableCtx(rctx)
+	return s.escapeTableCtx(fallbackRenderContext())
 }
 
 func (s *subQueryTable) escapeTableCtx(ctx *renderContext) string {

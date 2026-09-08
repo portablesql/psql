@@ -273,13 +273,14 @@ func TestMiscVecOrderBy(t *testing.T) {
 	s := psql.VecOrderBy(psql.F("embedding"), vec, psql.VectorL2)
 	assert.NotNil(t, s)
 
-	// Build a query using VecOrderBy
+	// Rendering on an engine without vector support is an error
 	ctx := context.Background()
 	query := psql.B().Select().From("items").OrderBy(s)
-	sql, err := query.Render(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, sql, "vec_l2_distance")
-	assert.Contains(t, sql, "ASC")
+	_, err := query.Render(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vector distance is not supported")
+	// the display form still uses the function syntax
+	assert.Contains(t, psql.VecL2Distance(psql.F("embedding"), vec).EscapeValue(), "vec_l2_distance")
 }
 
 func TestMiscVecOrderByCosine(t *testing.T) {
@@ -289,10 +290,9 @@ func TestMiscVecOrderByCosine(t *testing.T) {
 
 	ctx := context.Background()
 	query := psql.B().Select().From("items").OrderBy(s)
-	sql, err := query.Render(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, sql, "vec_cosine_distance")
-	assert.Contains(t, sql, "ASC")
+	_, err := query.Render(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vector distance is not supported")
 }
 
 func TestMiscVecOrderByInnerProduct(t *testing.T) {
@@ -302,9 +302,9 @@ func TestMiscVecOrderByInnerProduct(t *testing.T) {
 
 	ctx := context.Background()
 	query := psql.B().Select().From("items").OrderBy(s)
-	sql, err := query.Render(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, sql, "vec_inner_product")
+	_, err := query.Render(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vector distance is not supported")
 }
 
 // === VectorComparison tests ===
@@ -349,10 +349,11 @@ func TestMiscVecDistanceInWhere(t *testing.T) {
 	vec := psql.Vector{1.0, 2.0}
 	dist := psql.VecL2Distance(psql.F("embedding"), vec)
 	query := psql.B().Select().From("items").Where(psql.Lt(dist, 0.5))
-	sql, err := query.Render(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, sql, "vec_l2_distance")
-	assert.Contains(t, sql, "<")
+	_, err := query.Render(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vector distance is not supported")
+	// the display form still uses the function syntax
+	assert.Contains(t, dist.EscapeValue(), "vec_l2_distance")
 }
 
 // === Hex type tests ===

@@ -13,10 +13,12 @@ type Error struct {
 	Err   error
 }
 
+// Unwrap returns the underlying database error, for use with errors.Is and errors.As.
 func (e *Error) Unwrap() error {
 	return e.Err
 }
 
+// Error returns the error message, including the query that failed.
 func (e *Error) Error() string {
 	return fmt.Sprintf("While running %s: %s", e.Query, e.Err)
 }
@@ -129,10 +131,25 @@ func IsDuplicate(err error) bool {
 	return false
 }
 
+// Sentinel errors returned by psql operations.
 var (
-	ErrNotReady           = errors.New("database is not ready (no connection is available)")
-	ErrNotNillable        = errors.New("field is nil but cannot be nil")
+	// ErrNotReady is returned when an operation is attempted on a nil table or
+	// backend, or on a feature the table does not have (e.g. [Restore] on a
+	// table without soft delete).
+	ErrNotReady = errors.New("database is not ready (no connection is available)")
+	// ErrNotNillable is returned when a nil value is given for a column that
+	// cannot be NULL.
+	ErrNotNillable = errors.New("field is nil but cannot be nil")
+	// ErrTxAlreadyProcessed is returned by [TxProxy.Commit] and
+	// [TxProxy.Rollback] once the transaction was already committed or rolled back.
 	ErrTxAlreadyProcessed = errors.New("transaction has already been committed or rollbacked")
-	ErrDeleteBadAssert    = errors.New("delete operation failed assertion")
-	ErrBreakLoop          = errors.New("exiting loop (not an actual error, used to break out of loop callbacks)")
+	// ErrDeleteBadAssert is returned by [DeleteOne] when the number of deleted
+	// rows is not exactly one.
+	ErrDeleteBadAssert = errors.New("delete operation failed assertion")
+	// ErrBreakLoop can be returned from an Each callback to stop the iteration
+	// without reporting an error.
+	ErrBreakLoop = errors.New("exiting loop (not an actual error, used to break out of loop callbacks)")
+	// ErrUnknownField is returned when a Go field or column name given to
+	// [FetchMapped] or [FetchGrouped] does not exist on the table.
+	ErrUnknownField = errors.New("unknown field or column")
 )

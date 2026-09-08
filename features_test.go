@@ -124,7 +124,7 @@ func TestIncrement(t *testing.T) {
 		Where(map[string]any{"id": 42})
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, `"views"="views"+1`)
+	assert.Contains(t, sql, `"views"="views"+(1)`)
 	assert.Contains(t, sql, `WHERE ("id"=42)`)
 }
 
@@ -136,7 +136,7 @@ func TestDecrement(t *testing.T) {
 		Where(map[string]any{"item_id": 10})
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, `"stock"="stock"-5`)
+	assert.Contains(t, sql, `"stock"="stock"-(5)`)
 }
 
 func TestSetRaw(t *testing.T) {
@@ -158,7 +158,7 @@ func TestIncrRenderArgs(t *testing.T) {
 		Where(map[string]any{"id": 42})
 	sql, args, err := query.RenderArgs(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, `"views"="views"+?`)
+	assert.Contains(t, sql, `"views"="views"+(?)`)
 	assert.Contains(t, args, 1)
 }
 

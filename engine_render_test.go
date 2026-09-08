@@ -176,8 +176,8 @@ func TestCILikeSQLite(t *testing.T) {
 		Where(map[string]any{"name": psql.Like{Like: "john%", CaseInsensitive: true}})
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, "LIKE")
-	assert.Contains(t, sql, "COLLATE NOCASE")
+	assert.Contains(t, sql, `LOWER("name") LIKE LOWER('john%')`)
+	assert.NotContains(t, sql, "COLLATE")
 	assert.NotContains(t, sql, "ILIKE")
 }
 
@@ -327,20 +327,21 @@ func TestRenderArgsMySQL(t *testing.T) {
 func TestLimitOffsetPostgreSQL(t *testing.T) {
 	ctx := ctxForEngine(psql.EnginePostgreSQL)
 
+	// Limit(offset, count) → LIMIT count OFFSET offset
 	query := psql.B().Select().From("users").Limit(10, 20)
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, "LIMIT 10")
-	assert.Contains(t, sql, "OFFSET 20")
+	assert.Contains(t, sql, "LIMIT 20 OFFSET 10")
 }
 
 func TestLimitOffsetMySQL(t *testing.T) {
 	ctx := ctxForEngine(psql.EngineMySQL)
 
+	// Limit(offset, count) → LIMIT count OFFSET offset (MySQL accepts this too)
 	query := psql.B().Select().From("users").Limit(10, 20)
 	sql, err := query.Render(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, sql, "LIMIT 10, 20")
+	assert.Contains(t, sql, "LIMIT 20 OFFSET 10")
 }
 
 // === FOR UPDATE not rendered on SQLite ===

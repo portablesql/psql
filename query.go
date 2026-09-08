@@ -34,10 +34,9 @@ func QT[T any](q string, args ...any) *SQLQueryT[T] {
 
 // Exec simply runs a query against the DefaultBackend
 //
-// Deprecated: use .Exec() instead
+// Deprecated: use [SQLQuery.Exec] instead
 func Exec(q *SQLQuery) error {
-	_, err := GetBackend(nil).DB().Exec(q.Query, q.Args...)
-	return err
+	return q.Exec(context.Background())
 }
 
 // Query performs a query and use a callback to advance results, meaning there is no need to
@@ -55,26 +54,12 @@ func Query(q *SQLQuery, cb func(*sql.Rows) error) error {
 //
 // Deprecated: use .Each() instead
 func QueryContext(ctx context.Context, q *SQLQuery, cb func(*sql.Rows) error) error {
-	r, err := doQueryContext(ctx, q.Query, q.Args...)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	for r.Next() {
-		err = cb(r)
-		if err != nil {
-			if errors.Is(err, ErrBreakLoop) {
-				return nil
-			}
-			return err
-		}
-	}
-	return nil
+	return q.Each(ctx, cb)
 }
 
 // Each will execute the query and call cb for each row, so you do not need to call
-// .Next() or .Close() on the object.
+// .Next() or .Close() on the object. Returning [ErrBreakLoop] from cb stops the
+// iteration without error.
 //
 // Example use: err := psql.Q("SELECT ...").Each(ctx, func(row *sql.Rows) error { ... })
 func (q *SQLQuery) Each(ctx context.Context, cb func(*sql.Rows) error) error {
@@ -93,16 +78,19 @@ func (q *SQLQuery) Each(ctx context.Context, cb func(*sql.Rows) error) error {
 			return err
 		}
 	}
-	return nil
+	return r.Err()
 }
 
-// Exec simply executes the query and returns any error that could have happened
+// Exec executes the query using whatever database object is attached to ctx
+// (transaction, connection or backend, see [ExecContext]) and returns any
+// error that could have happened.
 func (q *SQLQuery) Exec(ctx context.Context) error {
-	_, err := GetBackend(ctx).DB().Exec(q.Query, q.Args...)
+	_, err := ExecContext(ctx, q.Query, q.Args...)
 	return err
 }
 
-// Each will execute the query and call cb for each row
+// Each will execute the query and call cb for each row. Returning
+// [ErrBreakLoop] from cb stops the iteration without error.
 func (q *SQLQueryT[T]) Each(ctx context.Context, cb func(*T) error) error {
 	t := Table[T]()
 	t.check(ctx)
@@ -113,9 +101,14 @@ func (q *SQLQueryT[T]) Each(ctx context.Context, cb func(*T) error) error {
 	}
 	defer r.Close()
 
+	plan, err := t.newScanPlan(ctx, r)
+	if err != nil {
+		return err
+	}
+
 	for r.Next() {
-		obj, err := t.spawn(ctx, r)
-		if err != nil {
+		obj := t.newobj()
+		if err := plan.scan(ctx, r, obj, true); err != nil {
 			return err
 		}
 		err = cb(obj)
@@ -126,10 +119,11 @@ func (q *SQLQueryT[T]) Each(ctx context.Context, cb func(*T) error) error {
 			return err
 		}
 	}
-	return nil
+	return r.Err()
 }
 
-// Single will execute the query and fetch a single result
+// Single will execute the query and fetch a single result, or return
+// [fs.ErrNotExist] if the query produced no row.
 func (q *SQLQueryT[T]) Single(ctx context.Context) (*T, error) {
 	t := Table[T]()
 	t.check(ctx)
@@ -140,6 +134,9 @@ func (q *SQLQueryT[T]) Single(ctx context.Context) (*T, error) {
 	}
 	defer r.Close()
 	if !r.Next() {
+		if err := r.Err(); err != nil {
+			return nil, err
+		}
 		return nil, fs.ErrNotExist
 	}
 	return t.spawn(ctx, r)
@@ -156,4 +153,18 @@ func (q *SQLQueryT[T]) All(ctx context.Context) ([]*T, error) {
 	}
 
 	return t.spawnAll(ctx, r)
+}
+
+// execBuilder renders and executes a builder query through [ExecContext],
+// wrapping execution failures in an [*Error] carrying the rendered query.
+func execBuilder(ctx context.Context, req *QueryBuilder) (sql.Result, error) {
+	query, args, err := req.RenderArgs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, &Error{Query: query, Err: err}
+	}
+	return res, nil
 }

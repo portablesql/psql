@@ -2,9 +2,9 @@ package psql
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
 )
 
 // Update saves changes to existing database records. Only fields that have changed
@@ -20,10 +20,16 @@ func Update[T any](ctx context.Context, target ...*T) error {
 }
 
 type updatedField struct {
-	f *StructField
-	v any
+	f  *StructField
+	v  any
+	fv reflect.Value
 }
 
+// Update writes the given objects back to the database. Objects that were
+// loaded with a fetch operation only have their changed columns written
+// (compared against the state recorded at scan time); other objects have every
+// column written. Objects without any change are skipped. The table needs a
+// primary or unique key. Query failures are returned as an [*Error].
 func (t *TableMeta[T]) Update(ctx context.Context, target ...*T) error {
 	if t == nil {
 		return ErrNotReady
@@ -35,6 +41,7 @@ func (t *TableMeta[T]) Update(ctx context.Context, target ...*T) error {
 
 	be := GetBackend(ctx)
 	engine := be.Engine()
+	bt := t.bind(be)
 
 	for _, obj := range target {
 		if h, ok := any(obj).(BeforeSaveHook); ok {
@@ -49,90 +56,62 @@ func (t *TableMeta[T]) Update(ctx context.Context, target ...*T) error {
 		}
 
 		// check for changed values
-		upd := make(map[string]*updatedField)
-		allvals := make(map[string]any)
+		var upd []*updatedField
 
 		val := reflect.ValueOf(obj).Elem()
 
 		st := t.rowstate(obj)
-		if st == nil || !st.init {
-			// we don't have a state → update everything
-			for _, f := range t.fields {
-				v := val.Field(f.Index).Interface()
-				upd[f.Column] = &updatedField{f: f, v: v}
-				allvals[f.Column] = v
-			}
-		} else {
-			for _, f := range t.fields {
-				// grab state value
-				stv, ok := st.val[f.Column]
-				newv := val.Field(f.Index).Interface()
-				allvals[f.Column] = newv
-
-				if !ok {
-					// no value in state → just force update
-					upd[f.Column] = &updatedField{f: f, v: newv}
+		hasState := st != nil && st.init
+		for _, f := range bt.fields {
+			newv := val.Field(f.Index).Interface()
+			if hasState {
+				if stv, ok := st.val[f.Index]; ok && stateEqual(f, newv, stv) {
 					continue
 				}
-				if f.Attrs["format"] == "json" {
-					// State stores raw JSON string; compare by re-marshaling
-					newJSON, _ := json.Marshal(newv)
-					if string(newJSON) != stv {
-						upd[f.Column] = &updatedField{f: f, v: newv}
-					}
-				} else if !reflect.DeepEqual(newv, stv) {
-					upd[f.Column] = &updatedField{f: f, v: newv}
-				}
 			}
+			upd = append(upd, &updatedField{f: f, v: newv, fv: val.Field(f.Index)})
 		}
 		if len(upd) == 0 {
 			// no update needed
 			continue
 		}
+		// deterministic column order so prepared statement caches can hit
+		sort.Slice(upd, func(i, j int) bool { return upd[i].f.Column < upd[j].f.Column })
 
 		// perform update
-		// Get the formatted table name (respects explicit names)
-		tableName := t.FormattedName(be)
-
 		d := engine.dialect()
-		req := "UPDATE " + QuoteName(tableName) + " SET "
+		req := "UPDATE " + QuoteName(bt.name) + " SET "
 		var flds []any
-		first := true
-		for k, v := range upd {
-			if !first {
+		for n, u := range upd {
+			if n > 0 {
 				req += ", "
-			} else {
-				first = false
 			}
-			flds = append(flds, engine.export(v.v, v.f))
-			req += QuoteName(k) + " = " + d.Placeholder(len(flds))
+			flds = append(flds, exportField(engine, u.fv, u.f))
+			req += QuoteName(u.f.Column) + " = " + d.Placeholder(len(flds))
 		}
 		req += " WHERE "
-		first = true
 		// render key
-		for _, col := range t.mainKey.Fields {
-			if !first {
+		for n, col := range bt.mainKey.Fields {
+			if n > 0 {
 				req += " AND "
-			} else {
-				first = false
 			}
-			flds = append(flds, engine.export(val.Field(t.fldcol[col].Index).Interface(), t.fldcol[col]))
+			kf := bt.fldcol[col]
+			flds = append(flds, exportField(engine, val.Field(kf.Index), kf))
 			req += QuoteName(col) + " = " + d.Placeholder(len(flds))
 		}
 
-		_, err := ExecContext(ctx, req, flds...)
-		if err != nil {
-			return err
+		if _, err := ExecContext(ctx, req, flds...); err != nil {
+			logQueryError(ctx, "psql:update:run_fail", t.table, req, err)
+			return &Error{Query: req, Err: err}
 		}
 		if st != nil {
-			if st.init {
-				// update state since update was successful
-				for k, v := range upd {
-					st.val[k] = v.v
-				}
-			} else {
+			// update state since update was successful
+			if !st.init {
 				st.init = true
-				st.val = allvals
+				st.val = make(map[int]any, len(bt.fields))
+			}
+			for _, u := range upd {
+				st.val[u.f.Index] = stateValue(u.f, u.v)
 			}
 		}
 

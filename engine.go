@@ -10,6 +10,7 @@ const (
 	EngineSQLite                   // SQLite (via modernc.org/sqlite)
 )
 
+// String returns a human readable name for the engine.
 func (e Engine) String() string {
 	switch e {
 	case EngineMySQL:

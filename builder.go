@@ -40,16 +40,16 @@ type EscapeTableable interface {
 //	    Limit(10).
 //	    RunQuery(ctx)
 type QueryBuilder struct {
-	Query       string
-	Fields      []any
-	Tables      []EscapeTableable
-	FieldsSet   []any
-	WhereData   WhereAND
-	GroupBy     []any
-	HavingData  WhereAND
-	OrderByData []SortValueable
-	LimitData   []int
-	renderData  []any // values?
+	Query       string            // query type: SELECT, INSERT, UPDATE, DELETE, REPLACE or INSERT_SELECT
+	Fields      []any             // selected fields (SELECT / INSERT ... SELECT)
+	Tables      []EscapeTableable // tables of the FROM / INTO / UPDATE clause
+	FieldsSet   []any             // SET / INSERT values (map[string]any entries, see [QueryBuilder.Set])
+	WhereData   WhereAND          // WHERE conditions, joined with AND
+	GroupBy     []any             // GROUP BY expressions
+	HavingData  WhereAND          // HAVING conditions, joined with AND
+	OrderByData []SortValueable   // ORDER BY expressions
+	LimitData   []int             // LIMIT as [count] or [offset, count] (see [QueryBuilder.Limit])
+	renderData  []any             // JOIN clauses
 
 	// conflict/upsert
 	ConflictColumns []string // ON CONFLICT (columns)
@@ -57,13 +57,13 @@ type QueryBuilder struct {
 	ConflictNothing bool     // DO NOTHING / INSERT IGNORE
 
 	// flags
-	Distinct      bool
-	CalcFoundRows bool
-	UpdateIgnore  bool
-	InsertIgnore  bool
-	ForUpdate     bool
-	SkipLocked    bool
-	NoWait        bool
+	Distinct      bool // SELECT DISTINCT
+	CalcFoundRows bool // SELECT SQL_CALC_FOUND_ROWS (MySQL)
+	UpdateIgnore  bool // UPDATE IGNORE (MySQL)
+	InsertIgnore  bool // INSERT IGNORE / INSERT OR IGNORE / ON CONFLICT DO NOTHING
+	ForUpdate     bool // SELECT ... FOR UPDATE (ignored on SQLite)
+	SkipLocked    bool // FOR UPDATE SKIP LOCKED
+	NoWait        bool // FOR UPDATE NOWAIT
 
 	err error
 }
@@ -154,21 +154,25 @@ func (q *QueryBuilder) From(table any) *QueryBuilder {
 }
 
 // Table adds a table to the query. Accepts a string or [EscapeTableable].
+// A string may carry an alias ("users AS u" or "users u"), rendered as
+// "users" AS "u".
 func (q *QueryBuilder) Table(table any) *QueryBuilder {
 	switch v := table.(type) {
 	case EscapeTableable:
 		q.Tables = append(q.Tables, v)
 	case string:
-		q.Tables = append(q.Tables, tableName(v))
+		q.Tables = append(q.Tables, parseTableRef(v))
 	default:
 		q.errorf("unsupported type %T passed as table", v)
 	}
 	return q
 }
 
-// Limit sets the LIMIT clause. With one argument, limits the row count.
-// With two arguments, Limit(count, offset) renders as LIMIT count OFFSET offset
-// (PostgreSQL/SQLite) or LIMIT count, offset (MySQL).
+// Limit sets the LIMIT clause. With one argument, Limit(count) limits the
+// number of rows. With two arguments, Limit(offset, count) skips offset rows
+// and returns at most count rows, following the MySQL "LIMIT offset, count"
+// convention (and [LimitFrom]). It renders as LIMIT count OFFSET offset on
+// every engine.
 func (q *QueryBuilder) Limit(v ...int) *QueryBuilder {
 	switch len(v) {
 	case 0:
@@ -192,9 +196,23 @@ func (q *QueryBuilder) Set(fields ...any) *QueryBuilder {
 // Where adds conditions to the WHERE clause. Accepts map[string]any for equality
 // conditions, [EscapeValueable] for comparisons (e.g., [Equal], [Gt], [Like]),
 // or multiple arguments which are joined with AND.
+//
+// Bare strings are not accepted as conditions (they would otherwise be bound
+// as values); wrap raw SQL in [Raw] instead.
 func (q *QueryBuilder) Where(where ...any) *QueryBuilder {
+	q.checkConditions("Where", where)
 	q.WhereData = append(q.WhereData, where...)
 	return q
+}
+
+// checkConditions records an error if any of the conditions is a bare string.
+func (q *QueryBuilder) checkConditions(method string, conds []any) {
+	for _, c := range conds {
+		if s, ok := c.(string); ok {
+			q.errorf("psql: %s(): bare string condition %q is not supported; use psql.Raw() for raw SQL or map[string]any for field conditions", method, s)
+			return
+		}
+	}
 }
 
 // OrderBy adds ORDER BY clauses. Use [S] to create sort fields:
@@ -217,8 +235,10 @@ func (q *QueryBuilder) GroupByFields(fields ...any) *QueryBuilder {
 	return q
 }
 
-// Having adds a HAVING clause to the query (used with GROUP BY).
+// Having adds a HAVING clause to the query (used with GROUP BY). It accepts
+// the same condition types as [QueryBuilder.Where].
 func (q *QueryBuilder) Having(having ...any) *QueryBuilder {
+	q.checkConditions("Having", having)
 	q.HavingData = append(q.HavingData, having...)
 	return q
 }
@@ -236,7 +256,9 @@ func (q *QueryBuilder) OnConflict(columns ...string) *QueryBuilder {
 }
 
 // DoUpdate specifies the fields to update on conflict. Accepts map[string]any
-// entries, similar to [QueryBuilder.Set].
+// entries, similar to [QueryBuilder.Set]. On PostgreSQL and SQLite the
+// conflict columns must be given with [QueryBuilder.OnConflict], otherwise
+// rendering fails; MySQL renders ON DUPLICATE KEY UPDATE.
 func (q *QueryBuilder) DoUpdate(fields ...any) *QueryBuilder {
 	q.ConflictUpdate = append(q.ConflictUpdate, fields...)
 	return q
@@ -271,8 +293,10 @@ func (q *QueryBuilder) SetNoWait() *QueryBuilder {
 	return q
 }
 
-// Join adds a JOIN clause to the query. The table can be a string (table name)
-// or an [EscapeTableable] such as [SubTable] for subquery joins:
+// Join adds a JOIN clause to the query. The table can be a string (table name,
+// optionally with an alias as in "orders o") or an [EscapeTableable] such as
+// [SubTable] for subquery joins. Conditions accept the same types as
+// [QueryBuilder.Where] and are joined with AND:
 //
 //	q.Join("LEFT", "orders", psql.Equal(psql.F("orders.user_id"), psql.F("users.id")))
 //	q.Join("LEFT", psql.SubTable(subQuery, "sq"), psql.Equal(psql.F("sq.id"), psql.F("t.id")))
@@ -280,13 +304,14 @@ func (q *QueryBuilder) Join(joinType string, table any, condition ...any) *Query
 	var tbl EscapeTableable
 	switch v := table.(type) {
 	case string:
-		tbl = tableName(v)
+		tbl = parseTableRef(v)
 	case EscapeTableable:
 		tbl = v
 	default:
 		q.errorf("unsupported type %T passed as join table", table)
 		return q
 	}
+	q.checkConditions("Join", condition)
 	q.renderData = append(q.renderData, &joinClause{
 		joinType:  joinType,
 		table:     tbl,
@@ -340,19 +365,25 @@ type SubIn struct {
 
 // escapeValueCtx renders the QueryBuilder as a parenthesized subquery, sharing
 // the parent context's args slice so parameter numbering continues correctly.
+// Rendering errors are recorded on the context so the parent query fails.
 func (q *QueryBuilder) escapeValueCtx(ctx *renderContext) string {
+	if ctx == nil {
+		ctx = fallbackRenderContext()
+	}
 	savedReq := ctx.req
 	err := q.render(ctx)
-	if err != nil {
-		ctx.req = savedReq
-		return "NULL"
-	}
 	subSQL := strings.Join(ctx.req, " ")
 	ctx.req = savedReq
+	if err != nil {
+		ctx.setErr(err)
+		return "NULL"
+	}
 	return "(" + subSQL + ")"
 }
 
-// EscapeValue renders the QueryBuilder as a parenthesized subquery (non-parameterized).
+// EscapeValue renders the QueryBuilder as a parenthesized subquery
+// (non-parameterized, engine-neutral). Rendering errors are not reported;
+// use [QueryBuilder.Render] to get them.
 func (q *QueryBuilder) EscapeValue() string {
 	return q.escapeValueCtx(nil)
 }
@@ -370,8 +401,7 @@ func (q *QueryBuilder) Apply(scopes ...Scope) *QueryBuilder {
 // embedded directly (not parameterized). For parameterized queries, use [QueryBuilder.RenderArgs].
 func (q *QueryBuilder) Render(ctx context.Context) (string, error) {
 	// Generate the actual SQL query
-	e := GetBackend(ctx).Engine()
-	rctx := &renderContext{e: e, d: e.dialect(), useArgs: false}
+	rctx := newRenderContext(GetBackend(ctx).Engine(), false)
 	err := q.render(rctx)
 	if err != nil {
 		return "", err
@@ -383,8 +413,7 @@ func (q *QueryBuilder) Render(ctx context.Context) (string, error) {
 // returns the arguments separately. Uses $1/$2/... for PostgreSQL and ? for MySQL/SQLite.
 func (q *QueryBuilder) RenderArgs(ctx context.Context) (string, []any, error) {
 	// Generate the actual SQL query
-	e := GetBackend(ctx).Engine()
-	rctx := &renderContext{e: e, d: e.dialect(), useArgs: true}
+	rctx := newRenderContext(GetBackend(ctx).Engine(), true)
 	err := q.render(rctx)
 	if err != nil {
 		return "", nil, err
@@ -471,7 +500,7 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			return err
 		}
 		ctx.append("SET")
-		ctx.append(escapeWhere(ctx, q.FieldsSet, ","))
+		ctx.append(renderAssignments(ctx, q.FieldsSet))
 	case "INSERT":
 		switch ctx.e {
 		case EnginePostgreSQL:
@@ -481,16 +510,13 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			if err != nil {
 				return err
 			}
-			colsVals := q.renderInsertColsVals(ctx)
-			ctx.append(colsVals)
+			ctx.append(q.renderInsertColsVals(ctx))
 			// ON CONFLICT clause
-			if len(q.ConflictUpdate) > 0 && len(q.ConflictColumns) > 0 {
-				conflictCols := make([]string, len(q.ConflictColumns))
-				for i, c := range q.ConflictColumns {
-					conflictCols[i] = QuoteName(c)
+			if len(q.ConflictUpdate) > 0 {
+				err = q.renderOnConflictUpdate(ctx)
+				if err != nil {
+					return err
 				}
-				ctx.append("ON CONFLICT (" + strings.Join(conflictCols, ",") + ") DO UPDATE SET")
-				ctx.append(escapeWhere(ctx, q.ConflictUpdate, ","))
 			} else if q.InsertIgnore || q.ConflictNothing {
 				ctx.append("ON CONFLICT DO NOTHING")
 			}
@@ -504,15 +530,12 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			if err != nil {
 				return err
 			}
-			colsVals := q.renderInsertColsVals(ctx)
-			ctx.append(colsVals)
-			if len(q.ConflictUpdate) > 0 && len(q.ConflictColumns) > 0 {
-				conflictCols := make([]string, len(q.ConflictColumns))
-				for i, c := range q.ConflictColumns {
-					conflictCols[i] = QuoteName(c)
+			ctx.append(q.renderInsertColsVals(ctx))
+			if len(q.ConflictUpdate) > 0 {
+				err = q.renderOnConflictUpdate(ctx)
+				if err != nil {
+					return err
 				}
-				ctx.append("ON CONFLICT (" + strings.Join(conflictCols, ",") + ") DO UPDATE SET")
-				ctx.append(escapeWhere(ctx, q.ConflictUpdate, ","))
 			}
 		default:
 			// MySQL / Unknown: use SET syntax (MySQL-native)
@@ -525,10 +548,10 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 				return err
 			}
 			ctx.append("SET")
-			ctx.append(escapeWhere(ctx, q.FieldsSet, ","))
+			ctx.append(renderAssignments(ctx, q.FieldsSet))
 			if len(q.ConflictUpdate) > 0 {
 				ctx.append("ON DUPLICATE KEY UPDATE")
-				ctx.append(escapeWhere(ctx, q.ConflictUpdate, ","))
+				ctx.append(renderAssignments(ctx, q.ConflictUpdate))
 			}
 		}
 	case "INSERT_SELECT":
@@ -577,11 +600,15 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			return err
 		}
 	}
+	if len(q.LimitData) > 0 && ctx.e == EnginePostgreSQL && (q.Query == "DELETE" || q.Query == "UPDATE") {
+		return fmt.Errorf("psql: %s ... LIMIT is not supported on %s", q.Query, ctx.e)
+	}
 	switch len(q.LimitData) {
 	case 1:
 		ctx.append("LIMIT", strconv.Itoa(q.LimitData[0]))
 	case 2:
-		ctx.append(ctx.d.LimitOffset(q.LimitData[0], q.LimitData[1]))
+		// LimitData is [offset, count]; LIMIT count OFFSET offset works on every engine
+		ctx.append("LIMIT", strconv.Itoa(q.LimitData[1]), "OFFSET", strconv.Itoa(q.LimitData[0]))
 	}
 	if q.ForUpdate && ctx.e != EngineSQLite {
 		// SQLite uses file/WAL-level locking, so FOR UPDATE is silently
@@ -594,6 +621,21 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 		}
 	}
 
+	return ctx.err
+}
+
+// renderOnConflictUpdate renders the ON CONFLICT (cols) DO UPDATE SET clause
+// used by PostgreSQL and SQLite. The conflict columns are mandatory.
+func (q *QueryBuilder) renderOnConflictUpdate(ctx *renderContext) error {
+	if len(q.ConflictColumns) == 0 {
+		return fmt.Errorf("psql: DoUpdate requires OnConflict columns on %s", ctx.e)
+	}
+	conflictCols := make([]string, len(q.ConflictColumns))
+	for i, c := range q.ConflictColumns {
+		conflictCols[i] = QuoteName(c)
+	}
+	ctx.append("ON CONFLICT (" + strings.Join(conflictCols, ",") + ") DO UPDATE SET")
+	ctx.append(renderAssignments(ctx, q.ConflictUpdate))
 	return nil
 }
 
@@ -606,30 +648,33 @@ func (q *QueryBuilder) renderFields(ctx *renderContext) error {
 }
 
 // renderInsertColsVals renders FieldsSet as "(col1,col2) VALUES (val1,val2)" format.
-// It iterates the FieldsSet entries (expected to be map[string]any) and extracts
-// sorted columns and their corresponding values.
+// It iterates the FieldsSet entries (which must be map[string]any) and extracts
+// sorted columns and their corresponding values. Values are rendered like SET
+// assignments ([Increment], [Decrement] and [SetRaw] are expanded).
 func (q *QueryBuilder) renderInsertColsVals(ctx *renderContext) string {
 	var cols []string
 	var vals []string
 
 	for _, fs := range q.FieldsSet {
-		switch m := fs.(type) {
-		case map[string]any:
-			keys := make([]string, 0, len(m))
-			for k := range m {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				cols = append(cols, QuoteName(k))
-				vals = append(vals, escapeCtx(ctx, m[k]))
-			}
+		m, ok := fs.(map[string]any)
+		if !ok {
+			ctx.errorf("psql: unsupported type %T in INSERT values; use map[string]any", fs)
+			continue
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			cols = append(cols, QuoteName(k))
+			vals = append(vals, renderAssignmentValue(ctx, k, m[k]))
 		}
 	}
 
 	if len(cols) == 0 {
-		// Fallback to SET syntax if no map entries found
-		return "SET " + escapeWhere(ctx, q.FieldsSet, ",")
+		ctx.errorf("psql: no fields to insert")
+		return ""
 	}
 
 	return "(" + strings.Join(cols, ",") + ") VALUES (" + strings.Join(vals, ",") + ")"

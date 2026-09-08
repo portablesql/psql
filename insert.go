@@ -2,7 +2,9 @@ package psql
 
 import (
 	"context"
-	"log/slog"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"reflect"
 )
 
@@ -23,97 +25,16 @@ func Insert[T any](ctx context.Context, target ...*T) error {
 	return Table[T]().Insert(ctx, target...)
 }
 
+// Insert inserts the given objects, one statement each, using a single
+// prepared statement. Fires [BeforeSaveHook], [BeforeInsertHook],
+// [AfterInsertHook] and [AfterSaveHook] if implemented.
+//
+// On engines supporting RETURNING (PostgreSQL) the objects are refreshed with
+// the stored row. Elsewhere, when the table's primary key is a single integer
+// field that is still zero, it is populated from the driver's LastInsertId
+// (auto-increment / rowid). Query failures are returned as an [*Error].
 func (t *TableMeta[T]) Insert(ctx context.Context, targets ...*T) error {
-	if t == nil {
-		return ErrNotReady
-	}
-	t.check(ctx)
-
-	be := GetBackend(ctx)
-	engine := be.Engine()
-
-	// Get the formatted table name (respects explicit names)
-	tableName := t.FormattedName(be)
-
-	// INSERT QUERY
-	req := "INSERT INTO " + QuoteName(tableName) + " (" + t.fldStr + ") VALUES (" + engine.Placeholders(len(t.fields), 1) + ")"
-
-	d := engine.dialect()
-	useReturning := false
-	if rr, ok := d.(ReturningRenderer); ok {
-		useReturning = rr.SupportsReturning()
-	}
-	if useReturning {
-		req += " RETURNING " + t.fldStr
-	}
-
-	stmt, err := doPrepareContext(ctx, req)
-	if err != nil {
-		slog.ErrorContext(ctx, req+"\n"+err.Error()+"\n"+debugStack(), "event", "psql:insert:prep_fail", "psql.table", tableName)
-		return &Error{Query: req, Err: err}
-	}
-	defer stmt.Close()
-
-	for _, target := range targets {
-		if h, ok := any(target).(BeforeSaveHook); ok {
-			if err := h.BeforeSave(ctx); err != nil {
-				return err
-			}
-		}
-		if h, ok := any(target).(BeforeInsertHook); ok {
-			if err := h.BeforeInsert(ctx); err != nil {
-				return err
-			}
-		}
-
-		val := reflect.ValueOf(target).Elem()
-
-		params := make([]any, len(t.fields))
-
-		for n, f := range t.fields {
-			fval := val.Field(f.Index)
-			switch fval.Kind() {
-			case reflect.Ptr, reflect.Slice, reflect.Map:
-				if fval.IsNil() {
-					continue
-				}
-			}
-			params[n] = engine.export(fval.Interface(), f)
-		}
-
-		if useReturning {
-			rows, err := stmt.QueryContext(ctx, params...)
-			if err != nil {
-				slog.ErrorContext(ctx, req+"\n"+err.Error()+"\n"+debugStack(), "event", "psql:insert:run_fail", "psql.table", tableName)
-				return &Error{Query: req, Err: err}
-			}
-			if rows.Next() {
-				if err := t.scanValueReturning(ctx, rows, target); err != nil {
-					rows.Close()
-					return err
-				}
-			}
-			rows.Close()
-		} else {
-			_, err := stmt.ExecContext(ctx, params...)
-			if err != nil {
-				slog.ErrorContext(ctx, req+"\n"+err.Error()+"\n"+debugStack(), "event", "psql:insert:run_fail", "psql.table", tableName)
-				return &Error{Query: req, Err: err}
-			}
-		}
-
-		if h, ok := any(target).(AfterInsertHook); ok {
-			if err := h.AfterInsert(ctx); err != nil {
-				return err
-			}
-		}
-		if h, ok := any(target).(AfterSaveHook); ok {
-			if err := h.AfterSave(ctx); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return t.insertRows(ctx, insertPlain, targets)
 }
 
 // InsertIgnore inserts records, silently ignoring conflicts (e.g., duplicate keys).
@@ -127,7 +48,35 @@ func InsertIgnore[T any](ctx context.Context, target ...*T) error {
 	return Table[T]().InsertIgnore(ctx, target...)
 }
 
+// InsertIgnore inserts the given objects, ignoring conflicting rows. See [InsertIgnore].
 func (t *TableMeta[T]) InsertIgnore(ctx context.Context, targets ...*T) error {
+	return t.insertRows(ctx, insertIgnore, targets)
+}
+
+// insertMode selects the statement built by insertRows.
+type insertMode int
+
+const (
+	insertPlain   insertMode = iota // INSERT
+	insertIgnore                    // INSERT IGNORE / ON CONFLICT DO NOTHING
+	insertReplace                   // REPLACE / ON CONFLICT DO UPDATE
+)
+
+func (m insertMode) String() string {
+	switch m {
+	case insertIgnore:
+		return "insert_ignore"
+	case insertReplace:
+		return "replace"
+	default:
+		return "insert"
+	}
+}
+
+var valuerType = reflect.TypeFor[driver.Valuer]()
+
+// insertRows is the shared implementation of Insert, InsertIgnore and Replace.
+func (t *TableMeta[T]) insertRows(ctx context.Context, mode insertMode, targets []*T) error {
 	if t == nil {
 		return ErrNotReady
 	}
@@ -135,37 +84,57 @@ func (t *TableMeta[T]) InsertIgnore(ctx context.Context, targets ...*T) error {
 
 	be := GetBackend(ctx)
 	engine := be.Engine()
+	bt := t.bind(be)
+	tableName := bt.name
 
-	// Get the formatted table name (respects explicit names)
-	tableName := t.FormattedName(be)
-
-	// INSERT IGNORE QUERY
-	ph := engine.Placeholders(len(t.fields), 1)
-	var req string
-
+	ph := engine.Placeholders(len(bt.fields), 1)
 	d := engine.dialect()
+	ur, hasUpsert := d.(UpsertRenderer)
+
+	var req string
+	switch mode {
+	case insertIgnore:
+		if hasUpsert {
+			req = ur.InsertIgnoreSQL(tableName, bt.fldStr, ph)
+		} else {
+			// Generic fallback: MySQL-like INSERT IGNORE
+			req = "INSERT IGNORE INTO " + QuoteName(tableName) + " (" + bt.fldStr + ") VALUES (" + ph + ")"
+		}
+	case insertReplace:
+		if hasUpsert {
+			req = ur.ReplaceSQL(tableName, bt.fldStr, ph, bt.mainKey, bt.fields)
+		} else {
+			// Generic fallback: MySQL-like REPLACE INTO
+			if bt.mainKey == nil {
+				return errors.New("cannot use Replace without a primary key")
+			}
+			req = "REPLACE INTO " + QuoteName(tableName) + " (" + bt.fldStr + ") VALUES (" + ph + ")"
+		}
+	default:
+		req = "INSERT INTO " + QuoteName(tableName) + " (" + bt.fldStr + ") VALUES (" + ph + ")"
+	}
+
 	useReturning := false
 	if rr, ok := d.(ReturningRenderer); ok {
 		useReturning = rr.SupportsReturning()
 	}
-
-	if ur, ok := d.(UpsertRenderer); ok {
-		req = ur.InsertIgnoreSQL(tableName, t.fldStr, ph)
-	} else {
-		// Generic fallback: MySQL-like INSERT IGNORE
-		req = "INSERT IGNORE INTO " + QuoteName(tableName) + " (" + t.fldStr + ") VALUES (" + ph + ")"
-	}
-
 	if useReturning {
-		req += " RETURNING " + t.fldStr
+		req += " RETURNING " + bt.fldStr
 	}
+
+	event := "psql:" + mode.String()
 
 	stmt, err := doPrepareContext(ctx, req)
 	if err != nil {
-		slog.ErrorContext(ctx, req+"\n"+err.Error()+"\n"+debugStack(), "event", "psql:insert_ignore:prep_fail", "psql.table", tableName)
+		logQueryError(ctx, event+":prep_fail", tableName, req, err)
 		return &Error{Query: req, Err: err}
 	}
 	defer stmt.Close()
+
+	var autoKey *StructField
+	if !useReturning {
+		autoKey = t.autoIncrementField(bt)
+	}
 
 	for _, target := range targets {
 		if h, ok := any(target).(BeforeSaveHook); ok {
@@ -173,52 +142,45 @@ func (t *TableMeta[T]) InsertIgnore(ctx context.Context, targets ...*T) error {
 				return err
 			}
 		}
-		if h, ok := any(target).(BeforeInsertHook); ok {
-			if err := h.BeforeInsert(ctx); err != nil {
-				return err
+		if mode != insertReplace {
+			if h, ok := any(target).(BeforeInsertHook); ok {
+				if err := h.BeforeInsert(ctx); err != nil {
+					return err
+				}
 			}
 		}
 
 		val := reflect.ValueOf(target).Elem()
-
-		params := make([]any, len(t.fields))
-
-		for n, f := range t.fields {
-			fval := val.Field(f.Index)
-			switch fval.Kind() {
-			case reflect.Ptr, reflect.Slice, reflect.Map:
-				if fval.IsNil() {
-					continue
-				}
-			}
-			params[n] = engine.export(fval.Interface(), f)
+		params := make([]any, len(bt.fields))
+		for n, f := range bt.fields {
+			params[n] = exportField(engine, val.Field(f.Index), f)
 		}
 
 		if useReturning {
 			rows, err := stmt.QueryContext(ctx, params...)
 			if err != nil {
-				slog.ErrorContext(ctx, req+"\n"+err.Error()+"\n"+debugStack(), "event", "psql:insert_ignore:run_fail", "psql.table", tableName)
+				logQueryError(ctx, event+":run_fail", tableName, req, err)
 				return &Error{Query: req, Err: err}
 			}
-			// ON CONFLICT DO NOTHING may produce no rows if conflict occurred
-			if rows.Next() {
-				if err := t.scanValueReturning(ctx, rows, target); err != nil {
-					rows.Close()
-					return err
-				}
+			if err := t.scanReturning(ctx, rows, target); err != nil {
+				return err
 			}
-			rows.Close()
 		} else {
-			_, err := stmt.ExecContext(ctx, params...)
+			res, err := stmt.ExecContext(ctx, params...)
 			if err != nil {
-				slog.ErrorContext(ctx, req+"\n"+err.Error()+"\n"+debugStack(), "event", "psql:insert_ignore:run_fail", "psql.table", tableName)
+				logQueryError(ctx, event+":run_fail", tableName, req, err)
 				return &Error{Query: req, Err: err}
+			}
+			if autoKey != nil {
+				t.applyLastInsertId(res, autoKey, target)
 			}
 		}
 
-		if h, ok := any(target).(AfterInsertHook); ok {
-			if err := h.AfterInsert(ctx); err != nil {
-				return err
+		if mode != insertReplace {
+			if h, ok := any(target).(AfterInsertHook); ok {
+				if err := h.AfterInsert(ctx); err != nil {
+					return err
+				}
 			}
 		}
 		if h, ok := any(target).(AfterSaveHook); ok {
@@ -228,4 +190,77 @@ func (t *TableMeta[T]) InsertIgnore(ctx context.Context, targets ...*T) error {
 		}
 	}
 	return nil
+}
+
+// exportField converts a struct field value into a query parameter. Nil
+// pointers, slices and maps become NULL, unless the (non-pointer) type
+// implements [driver.Valuer], such as a zero [Set]: its Value() is used, so a
+// NOT NULL column keeps receiving the Valuer's representation.
+func exportField(engine Engine, fval reflect.Value, f *StructField) any {
+	switch fval.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if fval.IsNil() {
+			return nil
+		}
+	case reflect.Slice, reflect.Map:
+		if fval.IsNil() {
+			if !fval.Type().Implements(valuerType) {
+				return nil
+			}
+			v, err := fval.Interface().(driver.Valuer).Value()
+			if err != nil {
+				return nil
+			}
+			return v
+		}
+	}
+	return engine.export(fval.Interface(), f)
+}
+
+// autoIncrementField returns the primary key field if it is a single integer
+// column that can be populated from LastInsertId, or nil.
+func (t *TableMeta[T]) autoIncrementField(bt *boundTable) *StructField {
+	if bt.mainKey == nil || bt.mainKey.Typ != KeyPrimary || len(bt.mainKey.Fields) != 1 {
+		return nil
+	}
+	f, ok := bt.fldcol[bt.mainKey.Fields[0]]
+	if !ok {
+		return nil
+	}
+	typ := t.typ.Field(f.Index).Type
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return f
+	}
+	return nil
+}
+
+// applyLastInsertId sets the primary key of target from res if the key is
+// still zero (or a nil pointer) and the driver reports a generated id.
+func (t *TableMeta[T]) applyLastInsertId(res sql.Result, f *StructField, target *T) {
+	fv := reflect.ValueOf(target).Elem().Field(f.Index)
+	if !fv.IsZero() {
+		return
+	}
+	id, err := res.LastInsertId()
+	if err != nil || id == 0 {
+		return
+	}
+	if fv.Kind() == reflect.Ptr {
+		fv.Set(reflect.New(fv.Type().Elem()))
+		fv = fv.Elem()
+	}
+	switch fv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fv.SetInt(id)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		fv.SetUint(uint64(id))
+	}
+	if st := t.rowstate(target); st != nil && st.init {
+		st.val[f.Index] = reflect.ValueOf(target).Elem().Field(f.Index).Interface()
+	}
 }

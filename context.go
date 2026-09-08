@@ -88,24 +88,30 @@ func Tx(ctx context.Context, cb func(ctx context.Context) error) error {
 func BeginTx(ctx context.Context, opts *sql.TxOptions) (*TxProxy, error) {
 	obj := ctx.Value(ctxDataObj)
 	if obj == nil {
-		return newTxCtrl(GetBackend(ctx).DB().BeginTx(ctx, opts))
+		tx, err := GetBackend(ctx).DB().BeginTx(ctx, opts)
+		return newTxCtrl(ctx, tx, err)
 	}
 
 	switch o := obj.(type) {
 	case *sql.Conn:
-		return newTxCtrl(o.BeginTx(ctx, opts))
+		tx, err := o.BeginTx(ctx, opts)
+		return newTxCtrl(ctx, tx, err)
 	case *sql.DB:
-		return newTxCtrl(o.BeginTx(ctx, opts))
+		tx, err := o.BeginTx(ctx, opts)
+		return newTxCtrl(ctx, tx, err)
 	case *Backend:
-		return newTxCtrl(o.db.BeginTx(ctx, opts))
+		tx, err := o.db.BeginTx(ctx, opts)
+		return newTxCtrl(ctx, tx, err)
 	case *TxProxy:
 		return o.BeginTx(ctx, opts)
 	case interface {
 		BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 	}:
-		return newTxCtrl(o.BeginTx(ctx, opts))
+		tx, err := o.BeginTx(ctx, opts)
+		return newTxCtrl(ctx, tx, err)
 	default:
-		return newTxCtrl(GetBackend(ctx).DB().BeginTx(ctx, opts))
+		tx, err := GetBackend(ctx).DB().BeginTx(ctx, opts)
+		return newTxCtrl(ctx, tx, err)
 	}
 }
 
@@ -134,7 +140,8 @@ func EscapeTx(ctx context.Context) (context.Context, bool) {
 		}
 		objV := obj.(*ctxValueObj)
 
-		if _, ok := objV.obj.(*sql.Tx); ok {
+		switch objV.obj.(type) {
+		case *TxProxy, *sql.Tx:
 			// we reached the point we wanted
 			return objV.Context, true
 		}

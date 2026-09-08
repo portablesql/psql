@@ -1,6 +1,13 @@
 package psql
 
-// Namer is an object that provides names to functions. This is based on gorm
+// Namer maps the names declared in Go to the names used in SQL. It is
+// configured per [Backend] with [WithNamer] or [Backend.SetNamer]; the default
+// is [LegacyNamer]. This is based on gorm.
+//
+// TableName is applied once to the Go type name of tables that have no
+// explicit psql.Name; ColumnName is applied once to the Go field name of
+// columns that have no explicit name in their sql tag. Explicit names are
+// always used as-is.
 type Namer interface {
 	TableName(table string) string
 	SchemaName(table string) string
@@ -99,14 +106,18 @@ func (CamelSnakeNamer) EnumTypeName(table, column string) string {
 }
 
 // LegacyNamer reproduces the behavior of the original implementation:
-// - Table names use CamelSnakeCase
+// - Table names use CamelSnakeCase (through [FormatTableName])
 // - Column names are kept as is (no transformation)
 // - Other names use standard prefixes with the original names
+//
+// It is the default namer, so existing databases keep working unchanged.
 type LegacyNamer struct{}
 
-// TableName returns the table name in Camel_Snake_Case format (original behavior)
+// TableName returns the table name in Camel_Snake_Case format (original
+// behavior): "UserProfile" becomes "User_Profile". It uses the [FormatTableName]
+// variable so that overriding it keeps taking effect.
 func (LegacyNamer) TableName(table string) string {
-	return formatCamelSnakeCase(table)
+	return FormatTableName(table)
 }
 
 // SchemaName returns the schema name in Camel_Snake_Case format

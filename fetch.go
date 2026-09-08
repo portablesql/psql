@@ -3,7 +3,7 @@ package psql
 import (
 	"context"
 	"fmt"
-	"log/slog"
+	"iter"
 	"os"
 )
 
@@ -61,6 +61,9 @@ func IncludeDeleted() *FetchOptions {
 func resolveFetchOpts(opts []*FetchOptions) *FetchOptions {
 	res := &FetchOptions{}
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		if opt.Lock {
 			res.Lock = true
 		}
@@ -119,105 +122,105 @@ func Fetch[T any](ctx context.Context, where any, opts ...*FetchOptions) ([]*T, 
 //
 //	iter, err := psql.Iter[User](ctx, nil)
 //	for user := range iter { ... }
+//
+// The query is executed when Iter returns; the iterator MUST be consumed (or
+// at least started and broken out of) to release the underlying rows. Errors
+// while scanning rows cannot be returned through this signature and cause a
+// panic; use [IterErr] to receive them as values instead.
 func Iter[T any](ctx context.Context, where any, opts ...*FetchOptions) (func(func(v *T) bool), error) {
 	return Table[T]().Iter(ctx, where, opts...)
 }
 
-func (t *TableMeta[T]) Get(ctx context.Context, where any, opts ...*FetchOptions) (*T, error) {
-	if t == nil {
-		return nil, ErrNotReady
-	}
-	t.check(ctx)
-	// simplified get
-	be := GetBackend(ctx)
-	opt := resolveFetchOpts(opts)
-	req := B().Select(Raw(t.fldStr)).From(t.FormattedName(be))
-	if where != nil {
-		req = req.Where(where)
-	}
-	t.applySoftDelete(req, opt)
-	req = req.Limit(1)
-
-	if opt.Lock {
-		req.ForUpdate = true
-		req.SkipLocked = opt.SkipLocked
-		req.NoWait = opt.NoWait
-	}
-	req = req.Apply(opt.Scopes...)
-
-	// run query
-	rows, err := req.RunQuery(ctx)
-	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:get:run_fail", "psql.table", t.table)
-		return nil, err
-	}
-	defer rows.Close()
-
-	if !rows.Next() {
-		// no result
-		return nil, os.ErrNotExist
-	}
-	result, err := t.spawn(ctx, rows)
-	// Close rows before preloading to free the connection
-	rows.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(opt.Preload) > 0 {
-		if err := Preload(ctx, []*T{result}, opt.Preload...); err != nil {
-			return nil, err
-		}
-	}
-
-	return result, nil
+// IterErr is like [Iter] but yields (record, error) pairs, so that errors
+// while reading rows are delivered to the loop instead of panicking. After an
+// error is yielded the iteration stops.
+//
+//	it, err := psql.IterErr[User](ctx, nil)
+//	for user, err := range it {
+//	    if err != nil { return err }
+//	    ...
+//	}
+//
+// As with [Iter], the iterator must be consumed to release the rows.
+func IterErr[T any](ctx context.Context, where any, opts ...*FetchOptions) (iter.Seq2[*T, error], error) {
+	return Table[T]().IterErr(ctx, where, opts...)
 }
 
-func (t *TableMeta[T]) FetchOne(ctx context.Context, target *T, where any, opts ...*FetchOptions) error {
-	if t == nil {
-		return ErrNotReady
-	}
-	t.check(ctx)
-	opt := resolveFetchOpts(opts)
-
-	// grab fields from target
-	if target == nil {
-		return fmt.Errorf("FetchOne requires a non-nil target")
-	}
-
-	// SELECT QUERY
-	be := GetBackend(ctx)
-	req := B().Select(Raw(t.fldStr)).From(t.FormattedName(be))
+// selectQuery builds the SELECT used by the fetch operations: all columns,
+// soft delete filter, sort, optional limit/offset, lock and scopes.
+func (t *TableMeta[T]) selectQuery(bt *boundTable, where any, opt *FetchOptions, withLimit bool) *QueryBuilder {
+	req := B().Select(Raw(bt.fldStr)).From(bt.name)
 	if where != nil {
 		req = req.Where(where)
 	}
-	t.applySoftDelete(req, opt)
+	t.applySoftDelete(bt, req, opt)
+
 	if len(opt.Sort) > 0 {
 		req = req.OrderBy(opt.Sort...)
 	}
 
-	req = req.Limit(1)
+	if withLimit && opt.LimitCount > 0 {
+		if opt.LimitStart > 0 {
+			req = req.Limit(opt.LimitStart, opt.LimitCount)
+		} else {
+			req = req.Limit(opt.LimitCount)
+		}
+	}
+
 	if opt.Lock {
 		req.ForUpdate = true
 		req.SkipLocked = opt.SkipLocked
 		req.NoWait = opt.NoWait
 	}
-	req = req.Apply(opt.Scopes...)
+	return req.Apply(opt.Scopes...)
+}
+
+// Get returns a new object loaded from the first record matching where, or
+// [os.ErrNotExist] if there is none. Sort, lock, scope, soft delete and
+// preload options are honored.
+func (t *TableMeta[T]) Get(ctx context.Context, where any, opts ...*FetchOptions) (*T, error) {
+	if t == nil {
+		return nil, ErrNotReady
+	}
+	res := t.newobj()
+	if err := t.FetchOne(ctx, res, where, opts...); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// FetchOne loads the first record matching where into target, or returns
+// [os.ErrNotExist] if there is none. See [FetchOne].
+func (t *TableMeta[T]) FetchOne(ctx context.Context, target *T, where any, opts ...*FetchOptions) error {
+	if t == nil {
+		return ErrNotReady
+	}
+	if target == nil {
+		return fmt.Errorf("FetchOne requires a non-nil target")
+	}
+	t.check(ctx)
+	opt := resolveFetchOpts(opts)
+	bt := t.bind(GetBackend(ctx))
+
+	req := t.selectQuery(bt, where, opt, false).Limit(1)
 
 	// run query
 	rows, err := req.RunQuery(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:fetch_one:run_fail", "psql.table", t.table)
+		logQueryError(ctx, "psql:fetch_one:run_fail", t.table, "", err)
 		return err
 	}
 	defer rows.Close()
 
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		// no result
 		return os.ErrNotExist
 	}
 
-	err = t.scanValue(ctx, rows, target)
+	err = t.ScanTo(ctx, rows, target)
 	// Close rows before preloading to free the connection
 	rows.Close()
 	if err != nil {
@@ -225,7 +228,7 @@ func (t *TableMeta[T]) FetchOne(ctx context.Context, target *T, where any, opts 
 	}
 
 	if len(opt.Preload) > 0 {
-		if err := Preload(ctx, []*T{target}, opt.Preload...); err != nil {
+		if err := PreloadOpts(ctx, []*T{target}, opt, opt.Preload...); err != nil {
 			return err
 		}
 	}
@@ -233,60 +236,31 @@ func (t *TableMeta[T]) FetchOne(ctx context.Context, target *T, where any, opts 
 	return nil
 }
 
+// Fetch returns every record matching where (nil for all records). See [Fetch].
 func (t *TableMeta[T]) Fetch(ctx context.Context, where any, opts ...*FetchOptions) ([]*T, error) {
 	if t == nil {
 		return nil, ErrNotReady
 	}
 	t.check(ctx)
 	opt := resolveFetchOpts(opts)
+	bt := t.bind(GetBackend(ctx))
 
-	// SELECT QUERY
-	be := GetBackend(ctx)
-	req := B().Select(Raw(t.fldStr)).From(t.FormattedName(be))
-	if where != nil {
-		req = req.Where(where)
-	}
-	t.applySoftDelete(req, opt)
-
-	if len(opt.Sort) > 0 {
-		req = req.OrderBy(opt.Sort...)
-	}
-
-	if opt.LimitCount > 0 {
-		if opt.LimitStart > 0 {
-			req = req.Limit(opt.LimitStart, opt.LimitCount)
-		} else {
-			req = req.Limit(opt.LimitCount)
-		}
-	}
-
-	if opt.Lock {
-		req.ForUpdate = true
-		req.SkipLocked = opt.SkipLocked
-		req.NoWait = opt.NoWait
-	}
-	req = req.Apply(opt.Scopes...)
+	req := t.selectQuery(bt, where, opt, true)
 
 	// run query
 	rows, err := req.RunQuery(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:fetch:run_fail", "psql.table", t.table)
+		logQueryError(ctx, "psql:fetch:run_fail", t.table, "", err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	var final []*T
-
-	for rows.Next() {
-		val, err := t.spawn(ctx, rows)
-		if err != nil {
-			return nil, err
-		}
-		final = append(final, val)
+	final, err := t.spawnAll(ctx, rows) // closes rows
+	if err != nil {
+		return nil, err
 	}
 
 	if len(opt.Preload) > 0 && len(final) > 0 {
-		if err := Preload(ctx, final, opt.Preload...); err != nil {
+		if err := PreloadOpts(ctx, final, opt, opt.Preload...); err != nil {
 			return nil, err
 		}
 	}
@@ -294,60 +268,65 @@ func (t *TableMeta[T]) Fetch(ctx context.Context, where any, opts ...*FetchOptio
 	return final, nil
 }
 
+// Iter runs the query and returns an iterator over the matching records.
+// See [Iter] for the consumption and error semantics.
 func (t *TableMeta[T]) Iter(ctx context.Context, where any, opts ...*FetchOptions) (func(func(v *T) bool), error) {
+	it, err := t.IterErr(ctx, where, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return func(yield func(v *T) bool) {
+		for v, err := range it {
+			if err != nil {
+				// iter process has no error reporting method other than panic
+				panic(err)
+			}
+			if !yield(v) {
+				return
+			}
+		}
+	}, nil
+}
+
+// IterErr runs the query and returns an iterator yielding (record, error)
+// pairs. See [IterErr].
+func (t *TableMeta[T]) IterErr(ctx context.Context, where any, opts ...*FetchOptions) (iter.Seq2[*T, error], error) {
 	if t == nil {
 		return nil, ErrNotReady
 	}
 	t.check(ctx)
 	opt := resolveFetchOpts(opts)
+	bt := t.bind(GetBackend(ctx))
 
-	// SELECT QUERY
-	be := GetBackend(ctx)
-	req := B().Select(Raw(t.fldStr)).From(t.FormattedName(be))
-	if where != nil {
-		req = req.Where(where)
-	}
-	t.applySoftDelete(req, opt)
-
-	if len(opt.Sort) > 0 {
-		req = req.OrderBy(opt.Sort...)
-	}
-
-	if opt.LimitCount > 0 {
-		if opt.LimitStart > 0 {
-			req = req.Limit(opt.LimitStart, opt.LimitCount)
-		} else {
-			req = req.Limit(opt.LimitCount)
-		}
-	}
-
-	if opt.Lock {
-		req.ForUpdate = true
-		req.SkipLocked = opt.SkipLocked
-		req.NoWait = opt.NoWait
-	}
-	req = req.Apply(opt.Scopes...)
+	req := t.selectQuery(bt, where, opt, true)
 
 	// run query
 	rows, err := req.RunQuery(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, err.Error()+"\n"+debugStack(), "event", "psql:fetch:run_fail", "psql.table", t.table)
+		logQueryError(ctx, "psql:iter:run_fail", t.table, "", err)
 		return nil, err
 	}
 
-	iterFunc := func(yield func(v *T) bool) {
+	return func(yield func(*T, error) bool) {
 		defer rows.Close()
 
+		plan, err := t.newScanPlan(ctx, rows)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
 		for rows.Next() {
-			val, err := t.spawn(ctx, rows)
-			if err != nil {
-				// iter process has no error reporting method other than panic
-				panic(err)
+			val := t.newobj()
+			if err := plan.scan(ctx, rows, val, true); err != nil {
+				yield(nil, err)
+				return
 			}
-			if !yield(val) {
+			if !yield(val, nil) {
 				return
 			}
 		}
-	}
-	return iterFunc, nil
+		if err := rows.Err(); err != nil {
+			yield(nil, err)
+		}
+	}, nil
 }

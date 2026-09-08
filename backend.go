@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,12 +14,21 @@ import (
 // Create one with [New], or use a submodule constructor (e.g., mysql.New, pgsql.New,
 // sqlite.New), then attach it to a context with [Backend.Plug] or [ContextBackend].
 type Backend struct {
-	db         *sql.DB
-	driverData any // engine-specific data (e.g., *pgxpool.Pool)
-	engine     Engine
-	checked    map[reflect.Type]bool
-	checkedLk  sync.RWMutex
-	namer      Namer // custom namer for table/column names
+	db            *sql.DB
+	driverData    any // engine-specific data (e.g., *pgxpool.Pool)
+	engine        Engine
+	checked       map[reflect.Type]*tableCheck
+	checkedLk     sync.RWMutex
+	namer         Namer // custom namer for table/column names
+	noSchemaCheck bool  // automatic CREATE/ALTER TABLE disabled (WithSchemaCheck(false))
+}
+
+// tableCheck tracks the schema check of one table type on a backend. lk
+// serializes concurrent checks of the same table; done is only set once a
+// check succeeded, so a failed check is retried on the next operation.
+type tableCheck struct {
+	lk   sync.Mutex
+	done atomic.Bool
 }
 
 // New returns a [Backend] that connects to the database identified by dsn.
@@ -40,7 +50,7 @@ func NewBackend(engine Engine, db *sql.DB, opts ...BackendOption) *Backend {
 	b := &Backend{
 		db:      db,
 		engine:  engine,
-		checked: make(map[reflect.Type]bool),
+		checked: make(map[reflect.Type]*tableCheck),
 		namer:   &LegacyNamer{},
 	}
 	for _, opt := range opts {
@@ -63,6 +73,17 @@ func WithDriverData(data any) BackendOption {
 func WithNamer(n Namer) BackendOption {
 	return func(b *Backend) {
 		b.namer = n
+	}
+}
+
+// WithSchemaCheck enables or disables the automatic schema check (CREATE
+// TABLE / ALTER TABLE) performed the first time each table is used on the
+// backend. It is enabled by default. When disabled, no DDL is ever issued
+// implicitly; call [Backend.CheckStructure] explicitly (e.g. at startup) for
+// the tables that should be created or migrated.
+func WithSchemaCheck(enabled bool) BackendOption {
+	return func(b *Backend) {
+		b.noSchemaCheck = !enabled
 	}
 }
 
@@ -124,29 +145,95 @@ func (be *Backend) SetNamer(n Namer) {
 	be.namer = n
 }
 
-// checkOnce return true if a table has been checked once, or false otherwise
-func (be *Backend) checkedOnce(typ reflect.Type) bool {
-	if be.isChecked(typ) {
-		return true
+// SchemaCheckEnabled reports whether the automatic schema check is enabled
+// (see [WithSchemaCheck]).
+func (be *Backend) SchemaCheckEnabled() bool {
+	return be != nil && !be.noSchemaCheck
+}
+
+// CheckStructure verifies that the table described by tv exists in the
+// database with the expected columns and keys, creating or altering it as
+// needed through the engine's [SchemaChecker]. It runs even when the
+// automatic check is disabled with [WithSchemaCheck], and is meant to be
+// called at startup in that mode:
+//
+//	if err := be.CheckStructure(ctx, psql.Table[User]()); err != nil { ... }
+//
+// A table whose psql.Name tag carries check=0 is never modified. On success
+// the table is remembered as checked, so later operations skip the automatic
+// check; on failure it is retried by the next operation (or call).
+func (be *Backend) CheckStructure(ctx context.Context, tv TableView) error {
+	if be == nil {
+		return ErrNotReady
+	}
+	if tv == nil {
+		return fmt.Errorf("psql: CheckStructure requires a table")
+	}
+	var typ reflect.Type
+	if tt, ok := tv.(interface{ tableType() reflect.Type }); ok {
+		typ = tt.tableType()
+	}
+	if bb, ok := tv.(interface{ bind(*Backend) *boundTable }); ok {
+		tv = bb.bind(be)
+	}
+	return be.runCheck(ctx, typ, tv)
+}
+
+// checkTable is the automatic schema check performed before operations.
+func (be *Backend) checkTable(ctx context.Context, typ reflect.Type, tv TableView) error {
+	if be.noSchemaCheck {
+		return nil
+	}
+	return be.runCheck(ctx, typ, tv)
+}
+
+// runCheck runs the dialect's CheckStructure for tv at most once
+// successfully per type, serializing concurrent attempts on the same type.
+// typ may be nil for views that are not a registered table, in which case the
+// result is not remembered.
+func (be *Backend) runCheck(ctx context.Context, typ reflect.Type, tv TableView) error {
+	sc, ok := be.Engine().dialect().(SchemaChecker)
+	if !ok {
+		return nil
+	}
+	if typ == nil {
+		return sc.CheckStructure(ctx, be, tv)
+	}
+
+	st := be.checkState(typ)
+	if st.done.Load() {
+		return nil
+	}
+
+	st.lk.Lock()
+	defer st.lk.Unlock()
+	if st.done.Load() {
+		return nil
+	}
+	if err := sc.CheckStructure(ctx, be, tv); err != nil {
+		return err
+	}
+	st.done.Store(true)
+	return nil
+}
+
+// checkState returns the check tracker for typ, creating it if needed.
+func (be *Backend) checkState(typ reflect.Type) *tableCheck {
+	be.checkedLk.RLock()
+	st := be.checked[typ]
+	be.checkedLk.RUnlock()
+	if st != nil {
+		return st
 	}
 
 	be.checkedLk.Lock()
 	defer be.checkedLk.Unlock()
-
-	// re-check now that we have an exclusive lock
-	_, ok := be.checked[typ]
-	if ok {
-		return true
+	if be.checked == nil {
+		be.checked = make(map[reflect.Type]*tableCheck)
 	}
-
-	// set to true & return false
-	be.checked[typ] = true
-	return false
-}
-
-func (be *Backend) isChecked(typ reflect.Type) bool {
-	be.checkedLk.RLock()
-	defer be.checkedLk.RUnlock()
-	_, ok := be.checked[typ]
-	return ok
+	if st = be.checked[typ]; st == nil {
+		st = &tableCheck{}
+		be.checked[typ] = st
+	}
+	return st
 }

@@ -145,8 +145,8 @@ func TestReadmeQueryBuilderExamples(t *testing.T) {
 			Limit(10, 20)
 		sql, err := query.Render(ctx)
 		require.NoError(t, err)
-		// Default context uses MySQL syntax for backward compatibility
-		assert.Equal(t, `SELECT * FROM "users" ORDER BY "created_at" DESC,"name" ASC LIMIT 10, 20`, sql)
+		// Limit(offset, count) renders LIMIT count OFFSET offset on every engine
+		assert.Equal(t, `SELECT * FROM "users" ORDER BY "created_at" DESC,"name" ASC LIMIT 20 OFFSET 10`, sql)
 
 		// Raw SQL in SELECT
 		query = psql.B().Select(psql.Raw("COUNT(DISTINCT user_id)")).From("orders")

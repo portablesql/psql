@@ -17,9 +17,12 @@ type Dialect interface {
 	// This handles engine-specific formatting (e.g., time.Time representation).
 	ExportArg(v any) any
 
-	// LimitOffset renders a two-argument LIMIT clause. The arguments are passed
-	// through as stored by [QueryBuilder.Limit](a, b). MySQL renders "LIMIT a, b",
-	// while PostgreSQL/SQLite render "LIMIT a OFFSET b".
+	// LimitOffset renders a two-argument LIMIT clause.
+	//
+	// Deprecated: the query builder no longer calls this method. It renders
+	// [QueryBuilder.Limit](offset, count) as "LIMIT count OFFSET offset" on
+	// every engine, which all supported engines accept. The method is kept
+	// in the interface so existing dialect implementations keep compiling.
 	LimitOffset(a, b int) string
 }
 
@@ -108,13 +111,14 @@ func (e Engine) dialect() Dialect {
 }
 
 // defaultDialect provides a minimal fallback dialect when no engine-specific
-// dialect has been registered. Uses ? placeholders and MySQL-like LIMIT syntax.
+// dialect has been registered. Uses ? placeholders.
 type defaultDialect struct{}
 
 func (defaultDialect) Placeholder(_ int) string { return "?" }
 
+// LimitOffset is kept for interface compatibility only (see [Dialect]).
 func (defaultDialect) LimitOffset(a, b int) string {
-	return "LIMIT " + intStr(a) + ", " + intStr(b)
+	return "LIMIT " + intStr(b) + " OFFSET " + intStr(a)
 }
 
 func (defaultDialect) ExportArg(v any) any {

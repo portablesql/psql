@@ -50,11 +50,11 @@ type Not struct {
 	V any
 }
 
+// EscapeValue renders the negated value as non-parameterized SQL: NOT (value).
+// When used as the value of a WHERE map, the negation is instead applied to
+// the operator (IS NOT NULL, NOT IN, NOT LIKE, !=, ...).
 func (n *Not) EscapeValue() string {
-	res := "NOT ("
-	res += Escape(n.V)
-	res += ")"
-	return res
+	return n.escapeValueCtx(nil)
 }
 
 func (n *Not) escapeValueCtx(ctx *renderContext) string {

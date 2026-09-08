@@ -6,8 +6,10 @@ import (
 )
 
 const (
-	// Use " for ANSI SQL, and ` for MySQL's own thing
+	// NameQuoteChar is the identifier quote character (" for ANSI SQL; MySQL
+	// is run in ANSI_QUOTES mode so it accepts it too).
 	NameQuoteChar = `"`
+	// NameQuoteRune is NameQuoteChar as a rune.
 	NameQuoteRune = '"'
 )
 
@@ -15,6 +17,7 @@ const (
 //
 // psql.F("field")
 // psql.F("table.field")
+// psql.F("table.*")
 // psql.F("", "field.with.dots")
 // psql.F("table", "field")
 // psql.F("table.with.dots", "field.with.dots")
@@ -78,6 +81,10 @@ func (f fieldName) EscapeValue() string {
 		// special case
 		return "*"
 	}
+	if tbl, ok := strings.CutSuffix(string(f), ".*"); ok && tbl != "" {
+		// "table.*" → "table".*
+		return QuoteName(tbl) + ".*"
+	}
 	// we consider table names won't contain dots, if it do use fullField instead of fieldName
 	return NameQuoteChar + strings.Replace(strings.ReplaceAll(string(f), NameQuoteChar, NameQuoteChar+NameQuoteChar), ".", NameQuoteChar+"."+NameQuoteChar, 1) + NameQuoteChar
 }
@@ -94,7 +101,10 @@ func (f *fullField) EscapeValue() string {
 	if f.tableName == "" {
 		return QuoteName(string(f.fieldName))
 	}
-	return NameQuoteChar + strings.ReplaceAll(string(f.tableName), NameQuoteChar, NameQuoteChar+NameQuoteChar) + NameQuoteChar + "." + NameQuoteChar + strings.ReplaceAll(string(f.fieldName), NameQuoteChar, NameQuoteChar+NameQuoteChar) + NameQuoteChar
+	if f.fieldName == "*" {
+		return QuoteName(string(f.tableName)) + ".*"
+	}
+	return QuoteName(string(f.tableName)) + "." + QuoteName(string(f.fieldName))
 }
 
 func (f *fullField) sortEscapeValue() string {
@@ -109,6 +119,36 @@ func (t tableName) String() string {
 
 func (t tableName) EscapeTable() string {
 	return QuoteName(string(t))
+}
+
+// aliasedTable is a table reference with an alias, rendered as "name" AS "alias".
+type aliasedTable struct {
+	name  tableName
+	alias string
+}
+
+func (a *aliasedTable) String() string {
+	return string(a.name) + " AS " + a.alias
+}
+
+func (a *aliasedTable) EscapeTable() string {
+	return a.name.EscapeTable() + " AS " + QuoteName(a.alias)
+}
+
+// parseTableRef parses a table reference given as a string. "name",
+// "name alias" and "name AS alias" are supported; anything else is quoted
+// as a single identifier.
+func parseTableRef(s string) EscapeTableable {
+	parts := strings.Fields(s)
+	switch len(parts) {
+	case 2:
+		return &aliasedTable{name: tableName(parts[0]), alias: parts[1]}
+	case 3:
+		if strings.EqualFold(parts[1], "AS") {
+			return &aliasedTable{name: tableName(parts[0]), alias: parts[2]}
+		}
+	}
+	return tableName(s)
 }
 
 // QuoteName quotes a SQL identifier (table name, column name, etc.) with double quotes,
