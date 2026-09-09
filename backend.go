@@ -97,6 +97,26 @@ func WithPoolDefaults(b *Backend) {
 	b.db.SetMaxIdleConns(32)
 }
 
+// Close releases the backend's connections: it closes the underlying *sql.DB
+// and, when the driver data (see [Backend.DriverData]) has a Close method
+// (for example a *pgxpool.Pool), closes it too. The backend must not be used
+// afterwards.
+func (be *Backend) Close() error {
+	if be == nil || be.db == nil {
+		return nil
+	}
+	err := be.db.Close()
+	switch c := be.driverData.(type) {
+	case interface{ Close() error }:
+		if cerr := c.Close(); err == nil {
+			err = cerr
+		}
+	case interface{ Close() }:
+		c.Close()
+	}
+	return err
+}
+
 // Plug attaches this backend to the given context. All psql operations using
 // the returned context will use this backend. Equivalent to [ContextBackend].
 func (be *Backend) Plug(ctx context.Context) context.Context {

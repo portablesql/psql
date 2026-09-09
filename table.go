@@ -220,9 +220,13 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 		autoInc := parseAutoInc(attrs)
 		delete(attrs, "autoinc")
 
-		if len(attrs) == 0 {
-			// import based on type
-			attrs["import"] = finfo.Type.String()
+		if _, hasType := attrs["type"]; !hasType {
+			if _, hasImport := attrs["import"]; !hasImport {
+				// no explicit SQL type: infer it from the Go type, letting the
+				// other attributes of the tag (null=, default=, size=...)
+				// override what the magic type provides
+				attrs["import"] = finfo.Type.String()
+			}
 		}
 		if autoInc {
 			if !isIntegerType(finfo.Type) {
