@@ -77,10 +77,10 @@ func scanSetter(v reflect.Value, from sql.RawBytes) error {
 func boolSetter(v reflect.Value, from sql.RawBytes) error {
 	// expect "from" to be 1 or 0
 	switch string(from) {
-	case "1", "true", "TRUE", "True":
+	case "1", "true", "TRUE", "True", "t", "T":
 		v.SetBool(true)
 		return nil
-	case "0", "false", "FALSE", "False":
+	case "0", "false", "FALSE", "False", "f", "F":
 		v.SetBool(false)
 		return nil
 	default:

@@ -72,3 +72,29 @@ func DefineMagicTypeEngine(e Engine, typ string, definition string) {
 	}
 	magicEngineTypes[e][typ] = definition
 }
+
+// isJSONFormat reports whether attrs describe a JSON-serialized column, either
+// directly (format=json) or through an import whose definition, on any
+// registered engine, carries format=json (for example import=JSON).
+func isJSONFormat(attrs map[string]string) bool {
+	return isJSONFormatDepth(attrs, 0)
+}
+
+func isJSONFormatDepth(attrs map[string]string, depth int) bool {
+	if attrs["format"] == "json" {
+		return true
+	}
+	imp, ok := attrs["import"]
+	if !ok || depth > 8 {
+		return false
+	}
+	if def, ok := magicTypes[imp]; ok && isJSONFormatDepth(parseAttrs(def), depth+1) {
+		return true
+	}
+	for _, engineTypes := range magicEngineTypes {
+		if def, ok := engineTypes[imp]; ok && isJSONFormatDepth(parseAttrs(def), depth+1) {
+			return true
+		}
+	}
+	return false
+}

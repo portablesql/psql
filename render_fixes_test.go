@@ -386,12 +386,14 @@ func TestFixDeleteUpdateLimitPostgreSQL(t *testing.T) {
 	_, err = psql.B().Update("t").Set(map[string]any{"a": 1}).Limit(1).Render(pg)
 	require.Error(t, err)
 
-	// still fine elsewhere
-	for _, e := range []psql.Engine{psql.EngineMySQL, psql.EngineSQLite} {
-		sql, err := psql.B().Delete().From("t").Where(map[string]any{"a": 1}).Limit(1).Render(ctxForEngine(e))
-		require.NoError(t, err, e)
-		assert.Equal(t, `DELETE FROM "t" WHERE ("a"=1) LIMIT 1`, sql, e)
-	}
+	// SQLite (modernc build) has no DELETE ... LIMIT either
+	_, err = psql.B().Delete().From("t").Where(map[string]any{"a": 1}).Limit(1).Render(ctxForEngine(psql.EngineSQLite))
+	require.Error(t, err)
+
+	// still fine on MySQL
+	sql, err := psql.B().Delete().From("t").Where(map[string]any{"a": 1}).Limit(1).Render(ctxForEngine(psql.EngineMySQL))
+	require.NoError(t, err)
+	assert.Equal(t, `DELETE FROM "t" WHERE ("a"=1) LIMIT 1`, sql)
 	// SELECT ... LIMIT on PG is fine
 	_, err = psql.B().Select().From("t").Limit(1).Render(pg)
 	require.NoError(t, err)

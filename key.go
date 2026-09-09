@@ -95,6 +95,9 @@ func (k *StructKey) loadKeyName(kn string) {
 	case strings.HasPrefix(kn, "UNIQUE:"):
 		kn = strings.TrimPrefix(kn, "UNIQUE:")
 		k.Typ = KeyUnique
+	default:
+		// key=name on a column adds the column to a plain index called name
+		k.Typ = KeyIndex
 	}
 	k.Name = kn
 	k.Key = kn

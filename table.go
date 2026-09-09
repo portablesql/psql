@@ -219,8 +219,9 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 		}
 
 		var setter func(reflect.Value, sql.RawBytes) error
-		if attrs["format"] == "json" {
-			// format=json fields are (un)marshaled with encoding/json
+		if isJSONFormat(attrs) {
+			// format=json fields (directly or through an import such as
+			// import=JSON) are (un)marshaled with encoding/json
 			jt := finfo.Type
 			for jt.Kind() == reflect.Ptr {
 				jt = jt.Elem()
@@ -242,6 +243,7 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 			Attrs:       attrs,
 			Rattrs:      make(map[Engine]map[string]string),
 			explicitCol: explicitCol,
+			json:        isJSONFormat(attrs),
 		}
 		names = append(names, QuoteName(col))
 

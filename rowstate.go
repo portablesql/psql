@@ -40,7 +40,7 @@ func (t *TableMeta[T]) rowstate(v *T) *rowState {
 // (their Go values may hold maps that cannot be deep-cloned or compared
 // reliably); everything else is deep-cloned in its declared type.
 func stateValue(fld *StructField, v any) any {
-	if fld.Attrs["format"] == "json" {
+	if fld.IsJSON() {
 		b, err := json.Marshal(v)
 		if err != nil {
 			return nil
@@ -53,7 +53,7 @@ func stateValue(fld *StructField, v any) any {
 // stateEqual reports whether the current field value matches the value
 // remembered by stateValue.
 func stateEqual(fld *StructField, current, stored any) bool {
-	if fld.Attrs["format"] == "json" {
+	if fld.IsJSON() {
 		b, err := json.Marshal(current)
 		if err != nil {
 			return false

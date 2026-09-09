@@ -26,6 +26,13 @@ type StructField struct {
 	rattrsLk    sync.Mutex
 	explicitCol bool // column name was given in the sql tag (namer does not apply)
 	primary     bool // member of the PRIMARY KEY: always NOT NULL
+	json        bool // format=json, directly or through an import
+}
+
+// IsJSON reports whether the column is stored as JSON text (format=json,
+// directly or through an import such as import=JSON).
+func (f *StructField) IsJSON() bool {
+	return f.json || f.Attrs["format"] == "json"
 }
 
 // clone returns a copy of f with an empty attribute cache.

@@ -6,7 +6,7 @@ import "encoding/json"
 // It delegates to the engine's [Dialect.ExportArg] for engine-specific formatting.
 // Fields with format=json are JSON-marshaled before export.
 func (e Engine) export(in any, f *StructField) any {
-	if f != nil && f.Attrs["format"] == "json" {
+	if f != nil && f.IsJSON() {
 		if in == nil {
 			return nil
 		}

@@ -600,7 +600,9 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			return err
 		}
 	}
-	if len(q.LimitData) > 0 && ctx.e == EnginePostgreSQL && (q.Query == "DELETE" || q.Query == "UPDATE") {
+	if len(q.LimitData) > 0 && ctx.e != EngineMySQL && ctx.e != EngineUnknown && (q.Query == "DELETE" || q.Query == "UPDATE") {
+		// PostgreSQL has no DELETE/UPDATE ... LIMIT and the modernc SQLite
+		// build is compiled without SQLITE_ENABLE_UPDATE_DELETE_LIMIT
 		return fmt.Errorf("psql: %s ... LIMIT is not supported on %s", q.Query, ctx.e)
 	}
 	switch len(q.LimitData) {
