@@ -25,6 +25,7 @@ type StructField struct {
 	Rattrs      map[Engine]map[string]string
 	rattrsLk    sync.Mutex
 	explicitCol bool // column name was given in the sql tag (namer does not apply)
+	primary     bool // member of the PRIMARY KEY: always NOT NULL
 }
 
 // clone returns a copy of f with an empty attribute cache.
@@ -56,6 +57,16 @@ func (f *StructField) GetAttrs(be *Backend) map[string]string {
 		f.Rattrs = make(map[Engine]map[string]string)
 	}
 	r := f.resolveAttrs(be, f.Attrs)
+	if f.primary && r["null"] != "0" {
+		// every engine requires primary key columns to be NOT NULL, whatever
+		// the Go type (a *int64 key is still populated from LastInsertId)
+		cp := make(map[string]string, len(r)+1)
+		for k, v := range r {
+			cp[k] = v
+		}
+		cp["null"] = "0"
+		r = cp
+	}
 	f.Rattrs[engine] = r
 	return r
 }

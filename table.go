@@ -263,6 +263,18 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 		panic("no fields for table")
 	}
 
+	// primary key members are NOT NULL on every engine
+	for _, k := range info.keys {
+		if k.Typ != KeyPrimary {
+			continue
+		}
+		for _, col := range k.Fields {
+			if fld, ok := info.fldcol[col]; ok {
+				fld.primary = true
+			}
+		}
+	}
+
 	info.fldStr = strings.Join(names, ",")
 	return info
 }
