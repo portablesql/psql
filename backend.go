@@ -21,6 +21,8 @@ type Backend struct {
 	checkedLk     sync.RWMutex
 	namer         Namer // custom namer for table/column names
 	noSchemaCheck bool  // automatic CREATE/ALTER TABLE disabled (WithSchemaCheck(false))
+	variant       Variant
+	serverVersion string
 }
 
 // tableCheck tracks the schema check of one table type on a backend. lk

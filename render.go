@@ -11,6 +11,7 @@ import (
 // encountered while rendering.
 type renderContext struct {
 	e       Engine
+	v       Variant // detected product (VariantUnknown when rendering without a backend)
 	d       Dialect
 	req     []string
 	args    []any
@@ -20,7 +21,15 @@ type renderContext struct {
 
 // newRenderContext returns a renderContext for the given engine.
 func newRenderContext(e Engine, useArgs bool) *renderContext {
-	return &renderContext{e: e, d: e.dialect(), useArgs: useArgs}
+	return &renderContext{e: e, v: e.defaultVariant(), d: e.dialect(), useArgs: useArgs}
+}
+
+// newBackendRenderContext returns a renderContext for a backend, carrying its
+// detected product variant.
+func newBackendRenderContext(be *Backend, useArgs bool) *renderContext {
+	rc := newRenderContext(be.Engine(), useArgs)
+	rc.v = be.Variant()
+	return rc
 }
 
 // fallbackRenderContext returns a non-parameterized renderContext for the

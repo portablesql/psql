@@ -401,7 +401,7 @@ func (q *QueryBuilder) Apply(scopes ...Scope) *QueryBuilder {
 // embedded directly (not parameterized). For parameterized queries, use [QueryBuilder.RenderArgs].
 func (q *QueryBuilder) Render(ctx context.Context) (string, error) {
 	// Generate the actual SQL query
-	rctx := newRenderContext(GetBackend(ctx).Engine(), false)
+	rctx := newBackendRenderContext(GetBackend(ctx), false)
 	err := q.render(rctx)
 	if err != nil {
 		return "", err
@@ -413,7 +413,7 @@ func (q *QueryBuilder) Render(ctx context.Context) (string, error) {
 // returns the arguments separately. Uses $1/$2/... for PostgreSQL and ? for MySQL/SQLite.
 func (q *QueryBuilder) RenderArgs(ctx context.Context) (string, []any, error) {
 	// Generate the actual SQL query
-	rctx := newRenderContext(GetBackend(ctx).Engine(), true)
+	rctx := newBackendRenderContext(GetBackend(ctx), true)
 	err := q.render(rctx)
 	if err != nil {
 		return "", nil, err
