@@ -1,7 +1,6 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/portablesql/psql.svg)](https://pkg.go.dev/github.com/portablesql/psql)
 [![Build Status](https://github.com/portablesql/psql/actions/workflows/test.yml/badge.svg)](https://github.com/portablesql/psql/actions/workflows/test.yml)
 [![Coverage Status](https://coveralls.io/repos/github/portablesql/psql/badge.svg?branch=master)](https://coveralls.io/github/portablesql/psql?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/portablesql/psql)](https://goreportcard.com/report/github.com/portablesql/psql)
 
 # psql
 
