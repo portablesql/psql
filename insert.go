@@ -294,6 +294,11 @@ func exportField(engine Engine, fval reflect.Value, f *StructField) any {
 	case reflect.Slice, reflect.Map:
 		if fval.IsNil() {
 			if !fval.Type().Implements(valuerType) {
+				if fval.Kind() == reflect.Slice && fval.Type().Elem().Kind() == reflect.Uint8 && f.Attrs["null"] != "1" {
+					// a nil []byte on a NOT NULL column (the default for
+					// []byte) is stored as empty bytes, not NULL
+					return engine.export([]byte{}, f)
+				}
 				return nil
 			}
 			v, err := fval.Interface().(driver.Valuer).Value()

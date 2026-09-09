@@ -1043,6 +1043,7 @@ type coreInsertItem struct {
 	Blob      []byte
 	Note      *string
 	Tags      map[string]string `sql:"-"`
+	Raw       []byte            `sql:",null=1"`
 }
 
 func TestCoreInsertNilHandling(t *testing.T) {
@@ -1051,18 +1052,19 @@ func TestCoreInsertNilHandling(t *testing.T) {
 	require.NoError(t, psql.Insert(ctx, &coreInsertItem{ID: 1}))
 	ins, ok := cfg.find("INSERT")
 	require.True(t, ok)
-	require.Len(t, ins.Args, 4)
+	require.Len(t, ins.Args, 5)
 	assert.Equal(t, int64(1), ins.Args[0])
 	assert.Equal(t, "", ins.Args[1], "zero psql.Set is a driver.Valuer and must not become NULL")
-	assert.Nil(t, ins.Args[2], "nil []byte becomes NULL")
+	assert.Equal(t, []byte{}, ins.Args[2], "nil []byte on a NOT NULL column becomes empty bytes")
 	assert.Nil(t, ins.Args[3], "nil pointer becomes NULL")
+	assert.Nil(t, ins.Args[4], "nil []byte on a nullable column becomes NULL")
 
 	cfg.reset()
 	note := "n"
 	require.NoError(t, psql.Replace(ctx, &coreInsertItem{ID: 2, Flags: psql.Set{"a", "b"}, Blob: []byte{1}, Note: &note}))
 	rep, ok := cfg.find("REPLACE")
 	require.True(t, ok)
-	assert.Equal(t, []driver.Value{int64(2), "a,b", []byte{1}, "n"}, rep.Args)
+	assert.Equal(t, []driver.Value{int64(2), "a,b", []byte{1}, "n", nil}, rep.Args)
 
 	cfg.reset()
 	require.NoError(t, psql.InsertIgnore(ctx, &coreInsertItem{ID: 3}))
@@ -1074,8 +1076,8 @@ func TestCoreInsertNilHandling(t *testing.T) {
 	require.NoError(t, psql.Update(ctx, &coreInsertItem{ID: 3}))
 	upd, ok := cfg.find("UPDATE")
 	require.True(t, ok)
-	assert.Equal(t, `UPDATE "core_insert_item" SET "Blob" = ?, "Flags" = ?, "ID" = ?, "Note" = ? WHERE "ID" = ?`, upd.Query)
-	assert.Equal(t, []driver.Value{nil, "", int64(3), nil, int64(3)}, upd.Args)
+	assert.Equal(t, `UPDATE "core_insert_item" SET "Blob" = ?, "Flags" = ?, "ID" = ?, "Note" = ?, "Raw" = ? WHERE "ID" = ?`, upd.Query)
+	assert.Equal(t, []driver.Value{[]byte{}, "", int64(3), nil, nil, int64(3)}, upd.Args)
 }
 
 func TestCoreInsertLastInsertId(t *testing.T) {
