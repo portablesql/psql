@@ -94,10 +94,10 @@ func BulkInsert[T any](ctx context.Context, rows []*T, opts ...BulkOption) error
 // correct for a single multi-row INSERT because InnoDB allocates the values
 // of one statement consecutively (innodb_autoinc_lock_mode 0, 1 and 2 alike
 // for "simple inserts", as long as no row in the batch supplies its own
-// value, which BulkInsert guarantees); on SQLite rowids of one multi-row
-// statement are not guaranteed to be consecutive, so the field is left
-// unset (use [Insert] when the ids matter). Query failures are returned as
-// an [*Error].
+// value, which BulkInsert guarantees); on SQLite the driver supports
+// RETURNING, so keys are read back like on PostgreSQL. With a dialect that
+// supports neither RETURNING nor consecutive ids the field is left unset (use
+// [Insert] when the ids matter). Query failures are returned as an [*Error].
 func (t *TableMeta[T]) BulkInsert(ctx context.Context, rows []*T, opts ...BulkOption) error {
 	if t == nil {
 		return ErrNotReady
