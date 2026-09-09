@@ -2,8 +2,15 @@ package psql
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotSupported is returned (possibly wrapped with details) when a feature
+// is not available on the current engine or product, for example DISTINCT ON
+// on MySQL or AS OF SYSTEM TIME on PostgreSQL. Check availability up front
+// with [Backend.Supports].
+var ErrNotSupported = errors.New("feature not supported on this database engine")
 
 // Optional dialect interfaces for advanced, engine-specific behaviour. A
 // dialect implements the ones it supports; the core falls back to a portable
@@ -56,18 +63,18 @@ type VariantAware interface {
 // Feature names understood by [VariantAware.SupportsFeature] and reported by
 // [Backend.Supports].
 const (
-	FeatureReturning       = "returning"          // INSERT/UPDATE/DELETE ... RETURNING
-	FeatureAdvisoryLocks   = "advisory_locks"     // named locks (GET_LOCK, pg_advisory_xact_lock)
-	FeatureListenNotify    = "listen_notify"      // PostgreSQL LISTEN/NOTIFY
-	FeatureAsOfSystemTime  = "as_of_system_time"  // CockroachDB AS OF SYSTEM TIME
-	FeatureRowTTL          = "row_ttl"            // CockroachDB ttl_expire_after
-	FeatureDistinctOn      = "distinct_on"        // PostgreSQL DISTINCT ON
-	FeatureCTE             = "cte"                // WITH ... AS (...)
-	FeatureFullText        = "fulltext"           // full-text search predicates
-	FeatureJSON            = "json"               // JSON path/containment operators
-	FeatureVectors         = "vectors"            // vector distance operators
-	FeatureIdentityColumns = "identity"           // autoinc columns
-	FeatureBulkCopy        = "bulk_copy"          // native bulk load (COPY)
+	FeatureReturning       = "returning"         // INSERT/UPDATE/DELETE ... RETURNING
+	FeatureAdvisoryLocks   = "advisory_locks"    // named locks (GET_LOCK, pg_advisory_xact_lock)
+	FeatureListenNotify    = "listen_notify"     // PostgreSQL LISTEN/NOTIFY
+	FeatureAsOfSystemTime  = "as_of_system_time" // CockroachDB AS OF SYSTEM TIME
+	FeatureRowTTL          = "row_ttl"           // CockroachDB ttl_expire_after
+	FeatureDistinctOn      = "distinct_on"       // PostgreSQL DISTINCT ON
+	FeatureCTE             = "cte"               // WITH ... AS (...)
+	FeatureFullText        = "fulltext"          // full-text search predicates
+	FeatureJSON            = "json"              // JSON path/containment operators
+	FeatureVectors         = "vectors"           // vector distance operators
+	FeatureIdentityColumns = "identity"          // autoinc columns
+	FeatureBulkCopy        = "bulk_copy"         // native bulk load (COPY)
 )
 
 // Supports reports whether the backend's engine and product support a
