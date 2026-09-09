@@ -1,46 +1,62 @@
 # Hooks
 
-Hooks are lifecycle callbacks that fire before or after database operations. Implement hook interfaces on your struct to add custom logic.
+Hooks are lifecycle callbacks implemented as methods on the row type. psql
+checks for them with type assertions on the `*T` passed to (or produced by)
+an operation, so they must be declared on the pointer receiver.
 
 ## Available Hooks
 
-| Interface | Method | Fires On |
+| Interface | Method | Fires on |
 |-----------|--------|----------|
-| `BeforeSaveHook` | `BeforeSave(ctx context.Context) error` | Insert, Update, Replace |
-| `AfterSaveHook` | `AfterSave(ctx context.Context) error` | Insert, Update, Replace |
-| `BeforeInsertHook` | `BeforeInsert(ctx context.Context) error` | Insert, InsertIgnore |
-| `AfterInsertHook` | `AfterInsert(ctx context.Context) error` | Insert, InsertIgnore |
-| `BeforeUpdateHook` | `BeforeUpdate(ctx context.Context) error` | Update |
-| `AfterUpdateHook` | `AfterUpdate(ctx context.Context) error` | Update |
-| `AfterScanHook` | `AfterScan(ctx context.Context) error` | Get, Fetch, FetchOne, Iter |
+| `BeforeSaveHook` | `BeforeSave(ctx) error` | `Insert`, `InsertIgnore`, `Replace`, `Update` |
+| `BeforeInsertHook` | `BeforeInsert(ctx) error` | `Insert`, `InsertIgnore` |
+| `AfterInsertHook` | `AfterInsert(ctx) error` | `Insert`, `InsertIgnore` |
+| `BeforeUpdateHook` | `BeforeUpdate(ctx) error` | `Update` |
+| `AfterUpdateHook` | `AfterUpdate(ctx) error` | `Update`, only when a statement was executed |
+| `AfterSaveHook` | `AfterSave(ctx) error` | `Insert`, `InsertIgnore`, `Replace`, `Update` (when a statement was executed) |
+| `AfterScanHook` | `AfterScan(ctx) error` | every row scanned by `Get`, `Fetch`, `FetchOne`, `Iter`, `IterErr`, `FetchMapped`, `FetchGrouped`, `RunQueryT`, `RunQueryTOne`, `QT(...).All/Single/Each`, `ScanTo`, association preloads and lazy futures |
+
+The `ctx` is the one given to the operation, so a hook runs inside the same
+transaction, if any.
 
 ## Execution Order
 
-### Insert / InsertIgnore
-
 ```
-BeforeSave -> BeforeInsert -> [SQL INSERT] -> AfterInsert -> AfterSave
-```
-
-### Update
-
-```
-BeforeSave -> BeforeUpdate -> [SQL UPDATE] -> AfterUpdate -> AfterSave
+Insert / InsertIgnore:  BeforeSave -> BeforeInsert -> INSERT -> AfterInsert -> AfterSave
+Update:                 BeforeSave -> BeforeUpdate -> UPDATE -> AfterUpdate -> AfterSave
+Replace:                BeforeSave -> REPLACE / UPSERT -> AfterSave
+Fetch & co:             SELECT -> scan row -> AfterScan
 ```
 
-### Replace
+Notes:
 
-```
-BeforeSave -> [SQL REPLACE/UPSERT] -> AfterSave
-```
+- `Update` skips objects that have no changed column (see
+  [change tracking](object-binding.md#change-tracking-and-update)): the
+  `Before*` hooks still run (and may modify the object, which counts as a
+  change), but `AfterUpdate` and `AfterSave` do not.
+- On PostgreSQL, `Insert` and `Replace` refresh the object from the
+  `RETURNING` row before the `After*` hooks run; that refresh does not fire
+  `AfterScan`.
+- `Delete`, `Restore` and `ForceDelete` operate by `where` clause and do
+  not load objects, so no hook fires for them.
 
-### Fetch / Get / FetchOne
+## Error Handling
 
-```
-[SQL SELECT] -> [scan row] -> AfterScan
-```
+- A `Before*` hook returning an error aborts the operation for that object
+  and is returned to the caller; nothing is written for it.
+- An `After*` hook returning an error is returned to the caller, but the
+  statement has already been executed.
+- An `AfterScan` error makes the fetch fail; `Get`/`FetchOne` return the
+  error, `Fetch` returns the error with the rows scanned so far discarded,
+  `IterErr` yields it and `Iter` panics.
 
-## Example: Setting Defaults
+With several objects, hooks run per object in order and the first error
+stops the batch. Objects already written stay written unless the whole call
+is inside a [transaction](transactions.md).
+
+## Examples
+
+### Defaults and validation
 
 ```go
 type Article struct {
@@ -48,60 +64,37 @@ type Article struct {
     ID        uint64    `sql:",key=PRIMARY"`
     Title     string    `sql:",type=VARCHAR,size=256"`
     Slug      string    `sql:",type=VARCHAR,size=256"`
-    CreatedAt time.Time `sql:",type=DATETIME"`
+    CreatedAt time.Time
 }
 
 func (a *Article) BeforeInsert(ctx context.Context) error {
     if a.Slug == "" {
-        a.Slug = slugify(a.Title)
+        a.Slug = strings.ToLower(strings.ReplaceAll(a.Title, " ", "-"))
     }
     if a.CreatedAt.IsZero() {
         a.CreatedAt = time.Now()
     }
     return nil
 }
-```
 
-The hook modifies the struct before the SQL is executed, so the changes are persisted to the database.
-
-## Example: Validation
-
-```go
-var ErrInvalidEmail = errors.New("invalid email address")
-
-type User struct {
-    psql.Name `sql:"users"`
-    ID        uint64 `sql:",key=PRIMARY"`
-    Email     string `sql:",type=VARCHAR,size=255"`
-}
-
-func (u *User) BeforeSave(ctx context.Context) error {
-    if !strings.Contains(u.Email, "@") {
-        return ErrInvalidEmail
+func (a *Article) BeforeSave(ctx context.Context) error {
+    if a.Title == "" {
+        return errors.New("title is required")
     }
     return nil
 }
 ```
 
-Returning an error from a "Before" hook prevents the database operation. The error propagates to the caller.
+Changes made by a `Before*` hook are what gets written.
 
-## Example: Audit Logging
-
-```go
-func (u *User) AfterUpdate(ctx context.Context) error {
-    slog.Info("user updated", "user_id", u.ID)
-    return nil
-}
-```
-
-## Example: Post-Load Processing
+### Post-load processing
 
 ```go
 type Config struct {
     psql.Name `sql:"configs"`
     ID        uint64 `sql:",key=PRIMARY"`
     RawJSON   string `sql:",type=TEXT"`
-    Parsed    map[string]any `sql:"-"` // not stored in DB
+    Parsed    map[string]any `sql:"-"`
 }
 
 func (c *Config) AfterScan(ctx context.Context) error {
@@ -109,22 +102,13 @@ func (c *Config) AfterScan(ctx context.Context) error {
 }
 ```
 
-`AfterScan` runs after every row is loaded from the database. Returning an error prevents the object from being returned (Get and Fetch will return the error).
+(For plain JSON columns, prefer a `format=json` field, which needs no hook.)
 
-## Error Handling
-
-- **Before hooks**: Returning an error prevents the database operation entirely. The row is not written.
-- **After hooks**: Returning an error is propagated to the caller. For Insert/Update, the database operation has already completed.
-- **AfterScan**: Returning an error prevents the scanned object from being returned to the caller.
-
-## Batch Operations
-
-When inserting or updating multiple objects, hooks are called individually for each object:
+### Audit logging
 
 ```go
-err := psql.Insert(ctx, &obj1, &obj2, &obj3)
-// Calls BeforeSave+BeforeInsert on obj1, then INSERT obj1, then AfterInsert+AfterSave on obj1
-// Then the same for obj2, then obj3
+func (u *User) AfterUpdate(ctx context.Context) error {
+    slog.InfoContext(ctx, "user updated", "user_id", u.ID)
+    return nil
+}
 ```
-
-If any hook returns an error, the operation stops at that point. Previously inserted objects in the batch are not rolled back (use transactions for atomicity).

@@ -1,120 +1,79 @@
 # Vector Support
 
-psql includes built-in support for vector columns and similarity search, compatible with PostgreSQL pgvector and CockroachDB native vector types.
+`psql.Vector` stores float32 vectors and, on PostgreSQL with the
+[pgvector](https://github.com/pgvector/pgvector) extension (or CockroachDB's
+native vectors), lets you order and filter by distance.
 
 ## Defining Vector Columns
-
-Use `psql.Vector` with the `VECTOR` type and specify the dimensions via `size`:
 
 ```go
 type Item struct {
     psql.Name `sql:"items"`
     ID        uint64      `sql:",key=PRIMARY"`
     Title     string      `sql:",type=VARCHAR,size=256"`
-    Embedding psql.Vector `sql:",type=VECTOR,size=384"` // 384-dimensional vector
+    Embedding psql.Vector `sql:",type=VECTOR,size=384"` // 384 dimensions
+    Idx       psql.Key    `sql:"embedding_idx,type=VECTOR,fields='Embedding',opclass=vector_cosine_ops"`
 }
 ```
 
-`psql.Vector` is a `[]float32` that implements `sql.Scanner` and `driver.Valuer` for automatic serialization.
+`psql.Vector` is a `[]float32` implementing `sql.Scanner` and
+`driver.Valuer`; its text form is `[1,2,3]`. A field of that type without
+attributes is inferred as a nullable `VECTOR` column without dimensions.
 
-## Storing Vectors
+| Engine | Column type | Distance operators | `VECTOR` keys |
+|--------|-------------|--------------------|---------------|
+| PostgreSQL / CockroachDB | `vector(N)` (pgvector) | `<->`, `<=>`, `<#>` | `CREATE INDEX ... USING hnsw` (`method=` and `opclass=` attributes) |
+| MySQL | `vector(N)` (MySQL 9+) | not supported: the query fails to render | not supported: a `VECTOR` key breaks the automatic `CREATE TABLE` |
+| SQLite | `text` | not supported: the query fails to render | ignored |
+
+On MySQL and SQLite, vectors can be stored and read back but not compared
+in SQL. Plain CRUD on a vector column works everywhere; the distance
+expressions are PostgreSQL-only, and the `VECTOR` key should only be
+declared on structs used with PostgreSQL (or SQLite, which skips it).
+
+## Storing and Reading
 
 ```go
-embedding := psql.Vector{0.1, 0.2, 0.3, ...} // your embedding from an ML model
+err := psql.Insert(ctx, &Item{ID: 1, Title: "Example", Embedding: psql.Vector{0.1, 0.2, 0.3}})
 
-err := psql.Insert(ctx, &Item{
-    ID:        1,
-    Title:     "Example",
-    Embedding: embedding,
-})
+item, err := psql.Get[Item](ctx, map[string]any{"ID": uint64(1)})
+fmt.Println(item.Embedding.Dimensions(), item.Embedding.String()) // 3 [0.1,0.2,0.3]
 ```
 
-## Vector Comparison Operators
+## Distance Expressions
 
-All five vector comparison operators are supported:
+| Function | pgvector operator | Meaning |
+|----------|-------------------|---------|
+| `psql.VecL2Distance(field, vec)` | `<->` | Euclidean distance |
+| `psql.VecCosineDistance(field, vec)` | `<=>` | cosine distance |
+| `psql.VecInnerProduct(field, vec)` | `<#>` | negative inner product |
+| `psql.VecEqual(field, vec)`, `psql.VecNotEqual(field, vec)` | `=`, `<>` | exact (in)equality, works on every engine |
 
-| Function | Description | SQL Operator |
-|----------|-------------|-------------|
-| `VecEqual` | Equality | `=` |
-| `VecNotEqual` | Inequality | `<>` |
-| `VecL2Distance` | L2 (Euclidean) distance | `<->` |
-| `VecCosineDistance` | Cosine distance | `<=>` |
-| `VecInnerProduct` | Negative inner product | `<#>` |
-
-### Equality / Inequality
+`psql.VecOrderBy(field, vec, op)` with `psql.VectorL2`, `psql.VectorCosine`
+or `psql.VectorInnerProduct` returns a sort expression (nearest first).
 
 ```go
-// Find items with an exact vector match
-rows, err := psql.B().Select().From("items").
-    Where(psql.VecEqual(psql.F("Embedding"), targetVec)).
-    RunQuery(ctx)
+queryVec := psql.Vector{0.1, 0.2, 0.3}
 
-// Find items that differ from a vector
-rows, err := psql.B().Select().From("items").
-    Where(psql.VecNotEqual(psql.F("Embedding"), targetVec)).
-    RunQuery(ctx)
-```
-
-### Nearest Neighbor Search
-
-Order results by vector distance to find the most similar items:
-
-```go
-queryVec := psql.Vector{0.1, 0.2, 0.3, ...}
-
-// Find nearest neighbors by L2 distance
-rows, err := psql.B().
-    Select("*").
-    From("items").
-    OrderBy(psql.VecL2Distance(psql.F("Embedding"), queryVec)).
-    Limit(10).
-    RunQuery(ctx)
-
-// Using VecOrderBy helper
-rows, err := psql.B().
-    Select("*").
-    From("items").
+// nearest neighbours
+items, err := psql.RunQueryT[Item](ctx, psql.B().Select().From("items").
     OrderBy(psql.VecOrderBy(psql.F("Embedding"), queryVec, psql.VectorCosine)).
-    Limit(10).
-    RunQuery(ctx)
+    Limit(10))
+// SELECT * FROM "items" ORDER BY "Embedding" <=> $1 ASC LIMIT 10
+
+// filter by threshold
+close, err := psql.RunQueryT[Item](ctx, psql.B().Select().From("items").
+    Where(psql.Lt(psql.VecCosineDistance(psql.F("Embedding"), queryVec), 0.5)))
+
+// distance as a column
+dist := psql.VecL2Distance(psql.F("Embedding"), queryVec)
+rows, err := psql.B().Select("ID", "Title", dist).From("items").OrderBy(dist).Limit(10).RunQuery(ctx)
+
+// exact match, any engine
+same, err := psql.Fetch[Item](ctx, psql.VecEqual(psql.F("Embedding"), queryVec))
 ```
 
-### Filtering by Distance
-
-Use distance expressions in WHERE to filter by a threshold:
-
-```go
-// Only items within cosine distance 0.5
-rows, err := psql.B().Select().From("items").
-    Where(psql.Lt(psql.VecCosineDistance(psql.F("Embedding"), queryVec), 0.5)).
-    RunQuery(ctx)
-```
-
-### Distance as a Column
-
-You can include the distance in your SELECT:
-
-```go
-dist := psql.VecCosineDistance(psql.F("Embedding"), queryVec)
-rows, err := psql.B().
-    Select("*", dist).
-    From("items").
-    OrderBy(dist).
-    Limit(10).
-    RunQuery(ctx)
-```
-
-## Engine-Specific Behavior
-
-- **PostgreSQL**: Uses pgvector operator syntax (`<->`, `<=>`, `<#>`)
-- **CockroachDB**: Uses native vector functions (`vec_l2_distance()`, etc.) and supports pgvector operator syntax
-- **Other engines**: Falls back to function call syntax
-
-## Vector Methods
-
-```go
-v := psql.Vector{1.0, 2.0, 3.0}
-
-v.String()      // "[1,2,3]"
-v.Dimensions()  // 3
-```
+The vector is passed as a query argument in its `[..]` text form. The
+`String()` form of a distance expression (used by `psql.Escape` and when no
+engine is known) is a display-only `vec_cosine_distance(field, '[...]')`
+call.

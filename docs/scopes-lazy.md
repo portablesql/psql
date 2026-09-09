@@ -2,147 +2,113 @@
 
 ## Scopes
 
-Scopes are reusable query modifier functions. Define them once, apply them everywhere.
-
-### Defining Scopes
-
-A `Scope` is a function that takes a `*QueryBuilder` and returns a modified `*QueryBuilder`:
+A `psql.Scope` is a function from `*psql.QueryBuilder` to
+`*psql.QueryBuilder`. Scopes are applied to the query built by `Fetch`,
+`Get`, `FetchOne`, `Iter`, `Count` and friends (through
+`psql.WithScope`) or to any builder (through `Apply`), after the `where`
+and options have been added.
 
 ```go
 var Active psql.Scope = func(q *psql.QueryBuilder) *psql.QueryBuilder {
     return q.Where(map[string]any{"Status": "active"})
 }
 
-var Recent psql.Scope = func(q *psql.QueryBuilder) *psql.QueryBuilder {
-    return q.OrderBy(psql.S("CreatedAt", "DESC"))
-}
-
-func LimitN(n int) psql.Scope {
+func RecentN(n int) psql.Scope {
     return func(q *psql.QueryBuilder) *psql.QueryBuilder {
-        return q.Limit(n)
+        return q.OrderBy(psql.S("CreatedAt", "DESC")).Limit(n)
     }
 }
+
+users, err := psql.Fetch[User](ctx, nil, psql.WithScope(Active, RecentN(10)))
+admins, err := psql.Fetch[User](ctx, map[string]any{"Role": "admin"}, psql.WithScope(Active), psql.Sort(psql.S("Login", "ASC")))
+n, err := psql.Count[User](ctx, nil, psql.WithScope(Active))
+
+rows, err := psql.B().Select().From("users").Apply(Active, RecentN(10)).RunQuery(ctx)
 ```
 
-### Using Scopes with Fetch
-
-Pass scopes via `WithScope` as fetch options:
-
-```go
-// Apply scopes to Fetch
-users, err := psql.Fetch[User](ctx, nil, psql.WithScope(Active, Recent, LimitN(10)))
-
-// Combine scopes with other options
-users, err := psql.Fetch[User](ctx,
-    map[string]any{"Role": "admin"},
-    psql.WithScope(Active),
-    psql.Sort(psql.S("Name", "ASC")),
-)
-
-// Works with Get and Count too
-count, err := psql.Count[User](ctx, nil, psql.WithScope(Active))
-```
-
-### Using Scopes with QueryBuilder
-
-Apply scopes directly on the query builder:
-
-```go
-query := psql.B().Select().From("users").Apply(Active).Apply(Recent)
-rows, err := query.RunQuery(ctx)
-```
-
-### Composing Scopes
-
-Since scopes are just functions, combine them freely:
-
-```go
-func ActiveRecent(n int) psql.Scope {
-    return func(q *psql.QueryBuilder) *psql.QueryBuilder {
-        return q.
-            Where(map[string]any{"Status": "active"}).
-            OrderBy(psql.S("CreatedAt", "DESC")).
-            Limit(n)
-    }
-}
-```
+Scopes see the raw builder: use column names, and remember that a scope
+setting `Limit` overrides a `psql.Limit` option (scopes run last).
 
 ## Lazy Loading
 
-`Future[T]` provides batch-optimized deferred database queries. Multiple futures for the same table and column are automatically batched into a single `WHERE col IN (...)` query when any one of them is resolved.
+`psql.Future[T]` defers a lookup by column value until it is needed, and
+resolves every pending future for the same table and column with a single
+`WHERE col IN (...)` query. It is meant for the "resolve a reference in each
+of many objects" pattern (API responses, templates).
 
-### Basic Usage
+### Batches
 
-```go
-// Create futures (no database query yet)
-future1 := psql.Lazy[User]("ID", "1")
-future2 := psql.Lazy[User]("ID", "2")
-future3 := psql.Lazy[User]("ID", "3")
-
-// Resolving any future batches all pending futures into one query
-user1, err := future1.Resolve(ctx)  // executes: SELECT ... WHERE ID IN (1, 2, 3)
-user2, err := future2.Resolve(ctx)  // already resolved by the batch above
-user3, err := future3.Resolve(ctx)  // already resolved
-```
-
-### How It Works
-
-1. `Lazy[T]("col", "val")` creates a `Future[T]` and registers it in a pending pool
-2. When `Resolve(ctx)` is called on any future, it collects all pending futures for the same column
-3. A single batch query `SELECT ... WHERE col IN (val1, val2, ...)` is executed
-4. Results are distributed to all waiting futures
-
-This is ideal for resolving references across many objects without N+1 queries, especially in API handlers or template rendering.
-
-### Deduplication
-
-Multiple calls to `Lazy[T]("ID", "42")` with the same column and value return the same `Future` instance:
+Two ways to create futures:
 
 ```go
-f1 := psql.Lazy[User]("ID", "42")
-f2 := psql.Lazy[User]("ID", "42")
-// f1 == f2 (same pointer)
+// Per-request batch carried by the context
+ctx = psql.WithLazyBatch(ctx)
+for _, post := range posts {
+    post.Author = psql.LazyCtx[User](ctx, "ID", post.AuthorID)
+}
+// the first Resolve (or JSON marshal) loads every author in one query
+author, err := posts[0].Author.Resolve(ctx)
+
+// Global per-table registry (no context)
+f1 := psql.Lazy[User]("ID", "1")
+f2 := psql.Lazy[User]("ID", "2")
+u1, err := f1.Resolve(ctx) // SELECT ... WHERE "ID" IN (?,?)
+u2, err := f2.Resolve(ctx) // already resolved
 ```
 
-### Concurrent Safety
+- `psql.LazyCtx(ctx, col, val)` joins the batch carried by `ctx` (created
+  with `psql.WithLazyBatch`; `psql.LazyBatchInContext(ctx)` tells whether
+  there is one). Without a batch in the context, the future gets a private
+  batch and resolves alone. The backend found in `ctx` is remembered so the
+  future is never resolved against another backend.
+- `psql.Lazy(col, val)` uses a per-table registry that only holds weak
+  references: a future that is dropped before being resolved is garbage
+  collected and never queried. `psql.LazyPending[T]()` reports how many
+  such futures are still pending. The backend is only known at resolve time,
+  so a leader batches the peers that are not yet bound, or bound to the same
+  backend. In multi-tenant code prefer `LazyCtx`.
+- Within a batch, `Lazy`/`LazyCtx` called again with the same column, value
+  and backend returns the same `*Future` until it is resolved.
+- The column may be a Go field name or a column name. Values are given as
+  strings and converted to the column's Go type before querying, so `"01"`
+  and `"1"` are the same key for an integer column. Only string, integer and
+  `[]byte` columns are batched; other column types resolve one query each.
+- Batches are chunked with `psql.PreloadChunkSize` keys per query.
 
-Futures are safe for concurrent use. Multiple goroutines can call `Resolve` simultaneously; only one will perform the actual query, and others will wait for the result.
+### Resolving
 
-### JSON Marshaling
+```go
+user, err := future.Resolve(ctx)
+switch {
+case errors.Is(err, os.ErrNotExist): // no such row
+case errors.Is(err, psql.ErrNotReady): // no backend available
+}
+```
 
-`Future[T]` implements `json.Marshaler`. Marshaling a future automatically resolves it:
+- `Resolve(nil)` uses the context given to `LazyCtx`, or `psql.DefaultBackend`
+  for `Lazy` futures; with no backend reachable it returns `psql.ErrNotReady`
+  without querying.
+- The first goroutine to resolve a pending future becomes the batch leader;
+  other goroutines resolving a future in that batch wait for the same
+  result. A resolved future returns its cached result (or error) forever.
+- Soft-deleted rows are not found.
+- `Future[T]` implements `json.Marshaler` (resolving with a nil context) and
+  `MarshalContextJSON` for `pjson.MarshalContext`, so a future in a response
+  struct is expanded to the record when encoded:
 
 ```go
 type Response struct {
     Author *psql.Future[User] `json:"author"`
 }
 
-resp := Response{Author: psql.Lazy[User]("ID", authorID)}
-data, err := json.Marshal(resp) // resolves the future, then marshals the User
-```
-
-### Not Found
-
-If no record matches the future's value, `Resolve` returns `os.ErrNotExist`:
-
-```go
-user, err := future.Resolve(ctx)
-if errors.Is(err, os.ErrNotExist) {
-    // record not found
-}
+data, err := json.Marshal(Response{Author: psql.LazyCtx[User](ctx, "ID", "42")})
 ```
 
 ## Change Detection
 
-`HasChanged` reports whether a loaded object has been modified since it was last fetched or saved:
-
-```go
-user, _ := psql.Get[User](ctx, map[string]any{"ID": uint64(1)})
-
-fmt.Println(psql.HasChanged(user)) // false
-
-user.Name = "New Name"
-fmt.Println(psql.HasChanged(user)) // true
-```
-
-This compares current field values against the state captured during the last database scan. Objects that were never loaded from the database always report as changed.
+Objects whose struct embeds `psql.Name` or `psql.Key` record their column
+values whenever they are scanned or written. `psql.HasChanged(obj)`
+compares the current values with that record; objects without a state field,
+or never loaded from nor saved to the database, always report `true`.
+`Update` uses the same record to write only the changed columns. See
+[Object Binding](object-binding.md#change-tracking-and-update).

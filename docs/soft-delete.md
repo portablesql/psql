@@ -1,78 +1,64 @@
 # Soft Delete
 
-psql automatically enables soft delete when a struct has a nullable `*time.Time` field named `DeletedAt` (or mapped to a column that follows the naming convention). Instead of removing rows, `Delete` sets the timestamp; queries automatically exclude soft-deleted records.
+A table has soft delete when its struct declares a nullable timestamp
+column for it. `Delete` then sets that column instead of removing the row,
+and reads exclude rows where it is set.
 
-## Defining a Soft-Delete Table
+## Declaring the Column
+
+Exactly two declarations enable soft delete:
 
 ```go
 type Post struct {
     psql.Name `sql:"posts"`
+    ID        uint64 `sql:",key=PRIMARY"`
+    Title     string `sql:",type=VARCHAR,size=256"`
+    DeletedAt *time.Time            // 1. a *time.Time field named DeletedAt
+}
+
+type Comment struct {
+    psql.Name `sql:"comments"`
     ID        uint64     `sql:",key=PRIMARY"`
-    Title     string     `sql:",type=VARCHAR,size=256"`
-    DeletedAt *time.Time `sql:",type=DATETIME"`  // enables soft delete
+    Removed   *time.Time `sql:",softdelete"` // 2. any *time.Time field tagged softdelete
 }
 ```
 
-The soft-delete field is auto-detected: any `*time.Time` field works. The library checks for fields that can hold a deletion timestamp.
+The field must be a `*time.Time` (NULL means "not deleted"). Other
+`*time.Time` fields have no effect. `psql.Table[T]().HasSoftDelete()`
+reports whether a table has the column.
 
-## How It Works
-
-### Delete (Soft)
-
-`Delete` sets `DeletedAt` to the current time instead of removing the row:
+## Behavior
 
 ```go
+// Delete: UPDATE "posts" SET "DeletedAt"=? WHERE ("ID"=?) AND ("DeletedAt" IS NULL)
 _, err := psql.Delete[Post](ctx, map[string]any{"ID": uint64(1)})
-// UPDATE "posts" SET "DeletedAt"=? WHERE "ID"=? AND "DeletedAt" IS NULL
+
+// reads exclude deleted rows: ... WHERE ("DeletedAt" IS NULL)
+posts, err := psql.Fetch[Post](ctx, nil)
+n, err := psql.Count[Post](ctx, nil)
+
+// include them
+all, err := psql.Fetch[Post](ctx, nil, psql.IncludeDeleted())
+
+// Restore: UPDATE "posts" SET "DeletedAt"=NULL WHERE ("ID"=?)
+_, err = psql.Restore[Post](ctx, map[string]any{"ID": uint64(1)})
+
+// ForceDelete: DELETE FROM "posts" WHERE ("ID"=?)
+_, err = psql.ForceDelete[Post](ctx, map[string]any{"ID": uint64(1)})
 ```
 
-The `AND "DeletedAt" IS NULL` condition prevents double-deleting already-deleted records.
-
-### Automatic Filtering
-
-All queries automatically exclude soft-deleted records:
-
-```go
-posts, _ := psql.Fetch[Post](ctx, nil)
-// SELECT ... FROM "posts" WHERE "DeletedAt" IS NULL
-
-count, _ := psql.Count[Post](ctx, nil)
-// SELECT COUNT(1) FROM "posts" WHERE "DeletedAt" IS NULL
-```
-
-### Include Soft-Deleted Records
-
-Use `IncludeDeleted()` to bypass the automatic filter:
-
-```go
-allPosts, _ := psql.Fetch[Post](ctx, nil, psql.IncludeDeleted())
-// SELECT ... FROM "posts" (no DeletedAt filter)
-```
-
-### Restore
-
-Un-delete records by clearing the `DeletedAt` timestamp:
-
-```go
-_, err := psql.Restore[Post](ctx, map[string]any{"ID": uint64(1)})
-// UPDATE "posts" SET "DeletedAt"=NULL WHERE "ID"=?
-```
-
-Returns `ErrNotReady` if the table has no soft-delete field.
-
-### Force Delete (Hard)
-
-Permanently remove a record, bypassing soft delete:
-
-```go
-_, err := psql.ForceDelete[Post](ctx, map[string]any{"ID": uint64(1)})
-// DELETE FROM "posts" WHERE "ID"=?
-```
-
-## Notes
-
-- Soft delete is enabled automatically when a `*time.Time` field is detected; no configuration is needed.
-- Tables without a `*time.Time` field use normal hard deletes.
-- `DeleteOne` (transactional single-row delete) also respects soft delete.
-- Soft-delete filtering applies to `Fetch`, `Get`, `FetchOne`, `Count`, `Iter`, and `Delete`.
-- `ForceDelete` and queries with `IncludeDeleted()` bypass the filter.
+- `Delete` adds `AND "DeletedAt" IS NULL`, so already deleted rows are not
+  touched (and are not counted in `RowsAffected`). `Delete(ctx, nil)` soft
+  deletes every live row.
+- The filter applies to `Get`, `Fetch`, `FetchOne`, `Iter`, `IterErr`,
+  `FetchMapped`, `FetchGrouped`, `Count`, lazy futures and association
+  preloads. Preloads follow the option of the parent fetch: `Fetch[Author](ctx,
+  nil, psql.IncludeDeleted(), psql.WithPreload("Books"))` also includes
+  deleted books, and `psql.PreloadOpts(ctx, authors, psql.IncludeDeleted(),
+  "Books")` does the same for an explicit preload.
+- `psql.Restore(ctx, nil)` restores every row. On a table without soft
+  delete, `Restore` returns `psql.ErrNotReady`.
+- `ForceDelete` is `Delete` with the `HardDelete` fetch option; `DeleteOne`
+  performs a soft delete on soft delete tables.
+- The query builder does not know about soft delete: `psql.B().Select().From("posts")`
+  returns deleted rows unless you add the condition yourself.

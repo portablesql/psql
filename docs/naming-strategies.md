@@ -1,75 +1,70 @@
 # Naming Strategies
 
-psql uses a `Namer` interface to control how Go names are mapped to SQL names for tables, columns, indexes, and other database objects.
+A `psql.Namer` maps the names declared in Go to the names used in SQL. It is
+configured per backend, so the same struct can be used against databases
+with different conventions.
 
 ## Setting a Naming Strategy
 
 ```go
 be, _ := psql.New("postgresql://...")
 
-// Use exact Go names (no transformation)
-be.SetNamer(&psql.DefaultNamer{})
+be.SetNamer(&psql.DefaultNamer{})    // keep Go names
+be.SetNamer(&psql.CamelSnakeNamer{}) // Camel_Snake_Case tables and columns
+be.SetNamer(&psql.LegacyNamer{})     // default: Camel_Snake_Case tables, columns untouched
 
-// Use Camel_Snake_Case for everything
-be.SetNamer(&psql.CamelSnakeNamer{})
-
-// Legacy behavior (default): Camel_Snake_Case for tables, no transform for columns
-be.SetNamer(&psql.LegacyNamer{})
+// or at construction time
+be2 := psql.NewBackend(be.Engine(), be.DB(), psql.WithNamer(&psql.DefaultNamer{}))
 ```
+
+The namer may be changed at any time; the resolved names are cached per
+backend and rebuilt when the namer changes.
+
+## What Gets Transformed
+
+Only names that were *not* given explicitly go through the namer, and each
+is transformed exactly once:
+
+| Declaration | Applied method | Explicit name |
+|-------------|----------------|---------------|
+| Table without `psql.Name` (Go type name) | `TableName(typeName)` | `psql.Name` tag value, used as-is |
+| Column without a name in its `sql` tag (Go field name) | `ColumnName(typeName, fieldName)` | first element of the `sql` tag, used as-is |
+
+Key names (`key=name`, `psql.Key` tag), join table names in `many_to_many`
+tags and the strings you pass to the query builder are never transformed.
+The `psql.Table[T]()` metadata always reports the declared names;
+`psql.Table[T]().FormattedName(be)` returns the table name used on a given
+backend.
 
 ## Available Namers
 
-### DefaultNamer
-
-Keeps names exactly as they are:
-
-| Go Name | Table Name | Column Name |
-|---------|------------|-------------|
-| `UserProfile` | `UserProfile` | `UserProfile` |
-| `OrderItem` | `OrderItem` | `OrderItem` |
-
-### CamelSnakeNamer
-
-Converts all names to `Camel_Snake_Case`:
-
-| Go Name | Table Name | Column Name |
-|---------|------------|-------------|
-| `UserProfile` | `User_Profile` | `User_Profile` |
-| `OrderItem` | `Order_Item` | `Order_Item` |
-
-### LegacyNamer (Default)
-
-Table names use `Camel_Snake_Case`, column names are kept as-is:
-
-| Go Name | Table Name | Column Name |
-|---------|------------|-------------|
-| `UserProfile` | `User_Profile` | `UserProfile` |
-| `OrderItem` | `Order_Item` | `OrderItem` |
-
-This is the default for backward compatibility.
-
-## Explicit Names Override the Namer
-
-When you set a name explicitly via `psql.Name`, it's used as-is regardless of the naming strategy:
+Given this struct:
 
 ```go
-type User struct {
-    psql.Name `sql:"my_users"` // always "my_users", namer is not applied
-    ID        uint64 `sql:",key=PRIMARY"`
+type UserProfile struct {
+    UserId      int64  `sql:",key=PRIMARY"`
+    DisplayName string `sql:",type=VARCHAR,size=64"`
+    AvatarURL   string `sql:"avatar_url,type=VARCHAR,size=255"`
 }
 ```
 
-Similarly, explicit column names in sql tags are used directly:
+| Namer | Table | `UserId` | `DisplayName` | `AvatarURL` (explicit) |
+|-------|-------|----------|---------------|------------------------|
+| `LegacyNamer` (default) | `User_Profile` | `UserId` | `DisplayName` | `avatar_url` |
+| `DefaultNamer` | `UserProfile` | `UserId` | `DisplayName` | `avatar_url` |
+| `CamelSnakeNamer` | `User_Profile` | `User_Id` | `Display_Name` | `avatar_url` |
 
-```go
-type User struct {
-    FirstName string `sql:"first_name,type=VARCHAR,size=128"` // always "first_name"
-}
-```
+`Camel_Snake_Case` inserts an underscore before every upper-case letter
+except the first, drops characters that are neither letters nor digits, and
+upper-cases the first letter: `HelloWorld` becomes `Hello_World`, `ABC`
+becomes `A_B_C`, `Table1` stays `Table1`.
+
+`LegacyNamer` uses the `psql.FormatTableName` variable for tables, so code
+that overrides that variable keeps working. Explicit column names in tags
+are the only way to get lower_snake_case columns with the built-in namers;
+implement your own `Namer` for a global convention.
 
 ## Namer Interface
-
-All naming strategies implement the `Namer` interface:
 
 ```go
 type Namer interface {
@@ -84,4 +79,8 @@ type Namer interface {
 }
 ```
 
-You can implement your own `Namer` for custom naming conventions.
+`TableName` and `ColumnName` are the methods used by the core; the others
+exist for dialects and custom tooling (the built-in dialects name indexes
+`<table>_<key>` and enum constraints `chk_enum_<hash>` regardless of the
+namer). Stateless namers (empty structs) are compared by type when caching;
+namers with fields are compared with `==`.

@@ -5,254 +5,107 @@
 
 # psql
 
-Platform SQL library for Go with object binding, query builder, hooks, associations, and vector support. Works with MySQL, PostgreSQL, CockroachDB, and SQLite.
+Portable SQL library for Go: object binding through struct tags, a query
+builder that renders engine-specific SQL, lifecycle hooks, associations,
+soft delete, transactions with savepoints and vector search. One code base
+runs on MySQL/MariaDB, PostgreSQL/CockroachDB and SQLite.
 
-Similar to GORM but focused on modern Go features (generics, 1.23 iterators) and a lighter footprint.
+Similar in scope to GORM, built on generics and range iterators with a
+smaller footprint. Requires Go 1.24+.
 
 ## Quick Start
 
 ```go
+package main
+
 import (
+    "context"
+    "fmt"
+
     "github.com/portablesql/psql"
-    _ "github.com/portablesql/psql-sqlite" // import the driver you need
+    _ "github.com/portablesql/psql-sqlite" // or psql-mysql, psql-pgsql
 )
 
-// Connect (engine auto-detected from DSN)
-be, err := psql.New(":memory:")
-ctx := be.Plug(context.Background())
-
-// Define a table
 type User struct {
     psql.Name `sql:"users"`
     ID        uint64 `sql:",key=PRIMARY"`
-    Name      string `sql:",type=VARCHAR,size=128"`
-    Email     string `sql:",type=VARCHAR,size=255"`
+    Email     string `sql:",type=VARCHAR,size=255,key=UNIQUE:email"`
+    Login     string `sql:",type=VARCHAR,size=128"`
 }
 
-// CRUD operations
-err = psql.Insert(ctx, &User{ID: 1, Name: "Alice", Email: "alice@example.com"})
+func main() {
+    be, err := psql.New(":memory:") // engine detected from the DSN
+    if err != nil {
+        panic(err)
+    }
+    ctx := be.Plug(context.Background())
 
-user, err := psql.Get[User](ctx, map[string]any{"ID": uint64(1)})
+    // the table is created on first use
+    if err := psql.Insert(ctx, &User{ID: 1, Login: "Alice", Email: "alice@example.com"}); err != nil {
+        panic(err)
+    }
 
-user.Name = "Alice Smith"
-err = psql.Update(ctx, user)
+    user, err := psql.Get[User](ctx, map[string]any{"ID": uint64(1)})
+    if err != nil {
+        panic(err)
+    }
+    user.Login = "Alice Smith"
+    if err := psql.Update(ctx, user); err != nil { // writes only the changed column
+        panic(err)
+    }
 
-users, err := psql.Fetch[User](ctx, map[string]any{"Name": "Alice Smith"})
+    users, _ := psql.Fetch[User](ctx, nil, psql.Sort(psql.S("Login", "ASC")), psql.Limit(10))
+    fmt.Println(len(users), users[0].Login)
+}
 ```
 
-## Features
-
-### Multi-Engine Support
-
-Import only the driver submodule you need:
+The database drivers are separate modules; import the one you need with a
+blank identifier:
 
 ```go
 import _ "github.com/portablesql/psql-mysql"   // MySQL / MariaDB
 import _ "github.com/portablesql/psql-pgsql"   // PostgreSQL / CockroachDB
-import _ "github.com/portablesql/psql-sqlite"  // SQLite
+import _ "github.com/portablesql/psql-sqlite"  // SQLite (pure Go)
 ```
 
-DSN format is auto-detected:
+## Features
 
-```go
-be, _ := psql.New("postgresql://...")        // PostgreSQL / CockroachDB
-be, _ := psql.New("user:pass@tcp(...)/db")   // MySQL
-be, _ := psql.New(":memory:")                // SQLite
-```
-
-### Hooks
-
-Lifecycle callbacks via Go interfaces:
-
-```go
-func (u *User) BeforeInsert(ctx context.Context) error {
-    u.CreatedAt = time.Now()
-    return nil
-}
-
-func (u *User) BeforeSave(ctx context.Context) error {
-    if !strings.Contains(u.Email, "@") {
-        return errors.New("invalid email")
-    }
-    return nil
-}
-```
-
-Available hooks: `BeforeSave`, `AfterSave`, `BeforeInsert`, `AfterInsert`, `BeforeUpdate`, `AfterUpdate`, `AfterScan`.
-
-### Associations
-
-Declare relationships and batch-preload to avoid N+1 queries:
-
-```go
-type Book struct {
-    psql.Name `sql:"books"`
-    ID        int64   `sql:",key=PRIMARY"`
-    AuthorID  int64   `sql:",type=BIGINT"`
-    Title     string  `sql:",type=VARCHAR,size=256"`
-    Author    *Author `psql:"belongs_to:AuthorID"`
-}
-
-// Fetch books with authors preloaded (2 queries, not N+1)
-books, err := psql.Fetch[Book](ctx, nil, psql.WithPreload("Author"))
-```
-
-Supports `belongs_to`, `has_one`, `has_many`, and `many_to_many`.
-
-### Scopes
-
-Reusable query modifiers:
-
-```go
-var Active psql.Scope = func(q *psql.QueryBuilder) *psql.QueryBuilder {
-    return q.Where(map[string]any{"Status": "active"})
-}
-
-func RecentN(n int) psql.Scope {
-    return func(q *psql.QueryBuilder) *psql.QueryBuilder {
-        return q.OrderBy(psql.S("CreatedAt", "DESC")).Limit(n)
-    }
-}
-
-users, err := psql.Fetch[User](ctx, nil, psql.WithScope(Active, RecentN(10)))
-```
-
-### Lazy Loading
-
-Batch-optimized deferred queries:
-
-```go
-future1 := psql.Lazy[User]("ID", "1")
-future2 := psql.Lazy[User]("ID", "2")
-
-// Resolving any future batches all pending futures into a single IN query
-user1, err := future1.Resolve(ctx)
-user2, err := future2.Resolve(ctx) // already resolved by the batch
-```
-
-### Soft Delete
-
-Automatic soft delete with timestamp columns:
-
-```go
-type Post struct {
-    psql.Name `sql:"posts"`
-    ID        uint64     `sql:",key=PRIMARY"`
-    Title     string     `sql:",type=VARCHAR,size=256"`
-    DeletedAt *time.Time `sql:",type=DATETIME"`  // soft delete field (auto-detected)
-}
-
-psql.Delete[Post](ctx, map[string]any{"ID": uint64(1)})  // sets DeletedAt
-psql.Restore[Post](ctx, map[string]any{"ID": uint64(1)}) // clears DeletedAt
-psql.ForceDelete[Post](ctx, map[string]any{"ID": uint64(1)}) // hard DELETE
-
-// Include soft-deleted records
-posts, _ := psql.Fetch[Post](ctx, nil, psql.IncludeDeleted())
-```
-
-### Iterators (Go 1.23+)
-
-```go
-iter, err := psql.Iter[User](ctx, map[string]any{"Status": "active"})
-for user := range iter {
-    fmt.Println(user.Name)
-}
-```
-
-### Transactions
-
-```go
-err := psql.Tx(ctx, func(ctx context.Context) error {
-    psql.Insert(ctx, &user)
-    psql.Insert(ctx, &profile)
-    return nil // commit; return error to rollback
-})
-```
-
-Supports nested transactions via savepoints.
-
-### Vector Similarity Search
-
-```go
-type Item struct {
-    psql.Name `sql:"items"`
-    ID        uint64      `sql:",key=PRIMARY"`
-    Embedding psql.Vector `sql:",type=VECTOR,size=384"`
-}
-
-// Nearest neighbor search
-query := psql.B().Select("*").From("items").
-    OrderBy(psql.VecCosineDistance(psql.F("Embedding"), queryVec)).
-    Limit(10)
-```
-
-### Query Builder
-
-```go
-query := psql.B().
-    Select("id", "name").
-    From("users").
-    Where(
-        psql.Equal(psql.F("status"), "active"),
-        psql.Gte(psql.F("age"), 18),
-    ).
-    OrderBy(psql.S("name", "ASC")).
-    Limit(50)
-
-rows, err := query.RunQuery(ctx)
-```
-
-### Portable Timestamp Arithmetic
-
-Engine-aware date/time helpers that generate correct SQL for all backends:
-
-```go
-// Records created in the last 24 hours (works on MySQL, PostgreSQL, and SQLite)
-query := psql.B().Select().From("events").
-    Where(psql.Gt(psql.F("created_at"), psql.DateSub(psql.Now(), 24*time.Hour)))
-// MySQL:      "created_at">NOW() - INTERVAL 1 DAY
-// PostgreSQL: "created_at">NOW() - INTERVAL '1 day'
-// SQLite:     "created_at">datetime(CURRENT_TIMESTAMP,'-1 days')
-```
-
-### Error Helpers
-
-```go
-err := psql.Insert(ctx, &duplicateRecord)
-if psql.IsDuplicate(err) {
-    // handle unique constraint violation (works across all engines)
-}
-if psql.IsNotExist(err) {
-    // handle missing table/column
-}
-```
-
-### Enum Support
-
-```go
-type StatusEnum string
-const (
-    StatusActive   StatusEnum = "active"
-    StatusInactive StatusEnum = "inactive"
-)
-
-type Account struct {
-    ID     uint64     `sql:",key=PRIMARY"`
-    Status StatusEnum `sql:",type=enum,values=active,inactive"`
-}
-```
+- **Object binding**: `sql` struct tags declare columns, keys and indexes;
+  tables are created and missing columns added on first use (or explicitly,
+  or never). Generic `Insert`, `Get`, `Fetch`, `Update`, `Replace`, `Delete`,
+  `Count`, iterators, change tracking. See [Object Binding](docs/object-binding.md).
+- **Query builder**: `psql.B().Select().From().Where()...` with map or
+  expression conditions, joins, subqueries, upserts, locking and portable
+  date arithmetic, rendered with placeholders for the target engine. See
+  [Query Builder](docs/query-builder.md).
+- **Hooks**: `BeforeSave`, `AfterInsert`, `AfterScan`, ... as methods on
+  your types. See [Hooks](docs/hooks.md).
+- **Associations**: `belongs_to`, `has_one`, `has_many`, `many_to_many`
+  with batched preloading. See [Associations](docs/associations.md).
+- **Transactions**: context-based, nested through savepoints, with an
+  escape hatch for audit logs. See [Transactions](docs/transactions.md).
+- **Soft delete**: a `DeletedAt *time.Time` field turns `Delete` into an
+  update and filters reads. See [Soft Delete](docs/soft-delete.md).
+- **Scopes and lazy loading**: reusable query modifiers, and futures that
+  resolve many lookups with one `IN` query. See [Scopes & Lazy](docs/scopes-lazy.md).
+- **Vectors**: `psql.Vector` columns and pgvector distance operators on
+  PostgreSQL. See [Vectors](docs/vectors.md).
+- **Naming strategies**: Go names, `Camel_Snake_Case`, or your own. See
+  [Naming Strategies](docs/naming-strategies.md).
 
 ## Documentation
 
 | Topic | Description |
 |-------|-------------|
-| [Getting Started](docs/getting-started.md) | Installation, connecting, driver imports, basic CRUD |
-| [Object Binding](docs/object-binding.md) | Struct tags, column types, keys, enums, custom types |
-| [Hooks](docs/hooks.md) | Lifecycle callbacks, execution order, validation |
+| [Getting Started](docs/getting-started.md) | Installation, drivers and DSNs, context, errors, pooling, logging, thread safety |
+| [Object Binding](docs/object-binding.md) | Struct tags, column types, keys, enums, schema management, CRUD and fetch options |
+| [Query Builder](docs/query-builder.md) | SELECT, WHERE, JOIN, GROUP BY, subqueries, upserts, raw SQL |
+| [Hooks](docs/hooks.md) | Lifecycle callbacks and their order |
 | [Associations](docs/associations.md) | belongs_to, has_one, has_many, many_to_many, preloading |
-| [Query Builder](docs/query-builder.md) | SELECT, WHERE, JOIN, GROUP BY, subqueries, ON CONFLICT |
-| [Transactions](docs/transactions.md) | Transactions, nested savepoints, safe deletion |
-| [Vectors](docs/vectors.md) | Vector columns, similarity search, distance functions |
-| [Naming Strategies](docs/naming-strategies.md) | DefaultNamer, CamelSnakeNamer, LegacyNamer |
-| [Scopes & Lazy](docs/scopes-lazy.md) | Reusable scopes, lazy loading, change detection |
-| [Soft Delete](docs/soft-delete.md) | Automatic soft delete, restore, force delete |
+| [Transactions](docs/transactions.md) | Transactions, savepoints, running queries outside a transaction |
+| [Soft Delete](docs/soft-delete.md) | Soft delete, restore, force delete |
+| [Scopes & Lazy](docs/scopes-lazy.md) | Scopes, lazy futures and batches, change detection |
+| [Vectors](docs/vectors.md) | Vector columns and similarity search |
+| [Naming Strategies](docs/naming-strategies.md) | LegacyNamer, DefaultNamer, CamelSnakeNamer |
+
+Package documentation: [pkg.go.dev/github.com/portablesql/psql](https://pkg.go.dev/github.com/portablesql/psql).

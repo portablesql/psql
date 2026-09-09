@@ -1,15 +1,23 @@
-#!/bin/make
-GOROOT:=$(shell PATH="/pkg/main/dev-lang.go.dev/bin:$$PATH" go env GOROOT)
-GOPATH:=$(shell $(GOROOT)/bin/go env GOPATH)
+#!/usr/bin/make
 
-.PHONY: test deps
+.PHONY: all build deps test fmt vet lint
 
-all:
-	GOROOT="$(GOROOT)" $(GOPATH)/bin/goimports -w -l .
-	$(GOROOT)/bin/go build -v
+all: fmt build
+
+build:
+	go build -v ./...
 
 deps:
-	$(GOROOT)/bin/go get -v -t .
+	go get -v -t ./...
 
 test:
-	$(GOROOT)/bin/go test -v
+	go test -race ./...
+
+fmt:
+	gofmt -s -w -l .
+
+vet:
+	go vet ./...
+
+lint: vet
+	@if command -v staticcheck >/dev/null 2>&1; then staticcheck ./...; else echo "staticcheck not installed (go install honnef.co/go/tools/cmd/staticcheck@latest)"; fi

@@ -1,144 +1,118 @@
 # Transactions
 
-psql supports transactions through context propagation, including nested transactions via savepoints.
+Transactions are carried by the context: every psql operation using a
+context that holds a transaction runs inside it, including raw
+`psql.Q(...)` queries and the automatic schema check.
 
-## Basic Transactions
-
-### Callback Style
-
-The simplest way to use transactions:
+## Callback Style
 
 ```go
 err := psql.Tx(ctx, func(ctx context.Context) error {
-    err := psql.Insert(ctx, &User{ID: 1, Name: "Alice"})
-    if err != nil {
-        return err // triggers rollback
+    if err := psql.Insert(ctx, &User{ID: 1, Login: "Alice"}); err != nil {
+        return err // rollback
     }
-    err = psql.Insert(ctx, &Profile{ID: 1, UserID: 1, Bio: "Hello"})
-    if err != nil {
-        return err // triggers rollback
+    if err := psql.Insert(ctx, &Profile{ID: 1, UserID: 1, Bio: "Hello"}); err != nil {
+        return err // rollback
     }
-    return nil // triggers commit
+    return nil // commit
 })
 ```
 
-`Tx` automatically commits if the callback returns `nil`, or rolls back if it returns an error.
+`psql.Tx` commits when the callback returns nil and rolls back otherwise
+(the callback's error is returned). A panic in the callback also rolls back,
+through the deferred `Rollback`.
 
-### Manual Style
-
-For more control:
+## Manual Style
 
 ```go
-tx, err := psql.BeginTx(ctx, nil)
+tx, err := psql.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 if err != nil {
     return err
 }
-defer tx.Rollback() // safe to call even after commit
+defer tx.Rollback() // no-op after a successful Commit
 
-ctx = psql.ContextTx(ctx, tx)
-
-err = psql.Insert(ctx, &User{ID: 1, Name: "Alice"})
-if err != nil {
-    return err // deferred rollback will execute
+txCtx := psql.ContextTx(ctx, tx)
+if err := psql.Insert(txCtx, &User{ID: 1, Login: "Alice"}); err != nil {
+    return err
 }
-
 return tx.Commit()
 ```
 
-## Nested Transactions
+`psql.BeginTx` returns a `*psql.TxProxy`, which embeds the underlying
+`*sql.Tx`. `Commit` and `Rollback` may each be called once: any later call
+returns `psql.ErrTxAlreadyProcessed`, which is what makes the deferred
+`Rollback` harmless.
 
-psql supports nested transactions using SQL savepoints. Starting a transaction inside an existing one creates a savepoint:
+## Nested Transactions (Savepoints)
+
+Starting a transaction inside a transactional context creates a savepoint
+on the same connection rather than a new transaction. This works with both
+styles and on every engine:
 
 ```go
 err := psql.Tx(ctx, func(ctx context.Context) error {
-    psql.Insert(ctx, &User{ID: 1, Name: "Alice"})
+    psql.Insert(ctx, &User{ID: 1, Login: "Alice"})
 
-    // Nested transaction (savepoint)
     err := psql.Tx(ctx, func(ctx context.Context) error {
-        psql.Insert(ctx, &User{ID: 2, Name: "Bob"})
-        return errors.New("oops") // rolls back to savepoint, Bob is NOT inserted
+        psql.Insert(ctx, &User{ID: 2, Login: "Bob"})
+        return errors.New("oops") // ROLLBACK TO SAVEPOINT: Bob is discarded
     })
-    // err is non-nil but we can continue
+    _ = err // the outer transaction continues
 
-    psql.Insert(ctx, &User{ID: 3, Name: "Charlie"})
-    return nil // commits: Alice and Charlie are saved
+    psql.Insert(ctx, &User{ID: 3, Login: "Charlie"})
+    return nil // COMMIT: Alice and Charlie are saved
 })
 ```
 
-Nested transactions are implemented as `SAVEPOINT`/`ROLLBACK TO` statements, which work across all supported engines.
-
-## Transaction Options
-
-Pass `*sql.TxOptions` to control isolation level and read-only mode:
-
-```go
-tx, err := psql.BeginTx(ctx, &sql.TxOptions{
-    Isolation: sql.LevelSerializable,
-    ReadOnly:  true,
-})
-```
-
-## Safe Deletion
-
-`DeleteOne` wraps the deletion in a transaction and verifies exactly one row was affected:
-
-```go
-err := psql.DeleteOne[User](ctx, map[string]any{"ID": uint64(1)})
-// Returns an error if 0 or 2+ rows would be deleted
-```
+- The nested `BeginTx` issues `SAVEPOINT Ln`; its `Commit` issues `RELEASE
+  SAVEPOINT Ln` and its `Rollback` issues `ROLLBACK TO SAVEPOINT Ln`. The
+  `*sql.TxOptions` of a nested transaction are ignored.
+- Nested transactions must be finished innermost first. Committing or
+  rolling back an outer `TxProxy` while an inner one is still open returns
+  an error ("nested transaction(s) still open") and leaves the transaction
+  untouched, so the outer proxy stays usable once the inner one is finished.
+- Depth is tracked per transaction, not per goroutine: do not use one
+  transaction from several goroutines.
 
 ## Running Queries Outside a Transaction
 
-Since psql routes queries based on context, you can run queries outside
-the current transaction by using a context that doesn't carry the
-transaction. This is useful for operations that must persist regardless
-of whether the transaction commits or rolls back, such as logging
-failures before a rollback.
-
-### Keeping the Original Context
-
-The simplest approach is to keep a reference to the pre-transaction context:
+Since routing is based on the context, a query that must persist regardless
+of the transaction's outcome (an audit log, an error record) only needs a
+context without the transaction. Keep the original context, or derive one
+with `psql.EscapeTx`, which returns the context that was active just below
+the innermost transaction (backend and other values preserved) and `false`
+when no transaction is present:
 
 ```go
-// outerCtx has the backend but no transaction
-outerCtx := ctx
+func logEvent(ctx context.Context, event string) {
+    outerCtx, ok := psql.EscapeTx(ctx)
+    if !ok {
+        outerCtx = ctx // no transaction active
+    }
+    _ = psql.Insert(outerCtx, &AuditLog{Event: event})
+}
 
-err := psql.Tx(ctx, func(ctx context.Context) error {
-    // ctx is inside the transaction
-    err := psql.Insert(ctx, &Order{ID: 1, Status: "pending"})
-    if err != nil {
-        // Log the failure outside the transaction — this INSERT commits
-        // immediately and survives the rollback that follows.
-        psql.Insert(outerCtx, &AuditLog{Event: "order_insert_failed", Detail: err.Error()})
-        return err // triggers rollback
+err := psql.Tx(ctx, func(txCtx context.Context) error {
+    if err := psql.Insert(txCtx, &Order{ID: 1, Status: "pending"}); err != nil {
+        logEvent(txCtx, "order_insert_failed") // committed immediately, survives the rollback
+        return err
     }
     return nil
 })
 ```
 
-Because `outerCtx` was captured before `Tx` wrapped the context with a
-transaction, any query using it goes directly to the database connection
-pool, completely independent of the transaction's fate.
+The escaped query runs on another connection from the pool while the
+transaction holds its own. On a SQLite in-memory database the pool has a
+single connection, so a query outside the transaction while it is open
+blocks forever waiting for that connection; file-based SQLite databases
+have a small pool and are fine.
 
-### Using EscapeTx
+## Safe Deletion
 
-When you only have access to the transactional context (e.g., inside a
-hook or a helper function), use [EscapeTx] to obtain the underlying
-non-transactional context:
+`psql.DeleteOne` runs the delete in its own (possibly nested) transaction
+and commits only if exactly one row was affected; otherwise it rolls back
+and returns an error wrapping `psql.ErrDeleteBadAssert`:
 
 ```go
-func logEvent(ctx context.Context, event string) {
-    outerCtx, ok := psql.EscapeTx(ctx)
-    if ok {
-        // outerCtx is outside the transaction
-        psql.Insert(outerCtx, &AuditLog{Event: event})
-    } else {
-        // no transaction was active, use ctx directly
-        psql.Insert(ctx, &AuditLog{Event: event})
-    }
-}
+err := psql.DeleteOne[User](ctx, map[string]any{"ID": uint64(1)})
 ```
-
-`EscapeTx` walks up the context chain and returns the context just
-below the transaction layer, preserving the backend and any other values
-attached above the transaction.

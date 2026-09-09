@@ -1,362 +1,337 @@
 # Query Builder
 
-The query builder provides a fluent interface for constructing SQL queries programmatically. It supports SELECT, INSERT, UPDATE, DELETE, and REPLACE operations with full support for WHERE clauses, JOINs, ORDER BY, LIMIT, and more.
+The query builder constructs SELECT, INSERT, UPDATE, DELETE and REPLACE
+statements from Go values and renders them for the engine of the backend in
+the context, with parameterized arguments. The generic CRUD functions use it
+internally, and their `where` arguments accept everything described here.
 
 ## Basic Usage
 
-Start building a query with `psql.B()`:
-
 ```go
-// Simple SELECT
-query := psql.B().Select("name", "email").From("users")
+// SELECT "name","email" FROM "users"
+q := psql.B().Select("name", "email").From("users")
 
-// SELECT with WHERE clause
-query := psql.B().Select().From("users").Where(map[string]any{"status": "active"})
+// SELECT * FROM "users" WHERE ("status"=?)
+q = psql.B().Select().From("users").Where(map[string]any{"status": "active"})
 
-// UPDATE
-query := psql.B().Update("users").Set(map[string]any{"status": "inactive"}).Where(map[string]any{"id": 123})
+// UPDATE "users" SET "status"=? WHERE ("id"=?)
+q = psql.B().Update("users").Set(map[string]any{"status": "inactive"}).Where(map[string]any{"id": 123})
 
-// DELETE
-query := psql.B().Delete().From("users").Where(map[string]any{"id": 123})
+// INSERT INTO "users" ... (SET syntax on MySQL, (cols) VALUES (...) elsewhere)
+q = psql.B().Insert().Table("users").Set(map[string]any{"id": 1, "name": "Alice"})
+
+// DELETE FROM "users" WHERE ("id"=?)
+q = psql.B().Delete().From("users").Where(map[string]any{"id": 123})
 ```
 
-## Helper Functions
-
-- `psql.F("field")` - Field reference (column name, properly quoted)
-- `psql.V("value")` - Value literal
-- `psql.S("field", "ASC")` - Sort field with direction
-- `psql.Raw("SQL")` - Raw SQL (use carefully)
-- `psql.Now()` - Portable current timestamp
-- `psql.DateAdd(expr, duration)` - Add a `time.Duration` to a timestamp expression
-- `psql.DateSub(expr, duration)` - Subtract a `time.Duration` from a timestamp expression
-
-## WHERE Conditions
-
-### Map Syntax
-
-The simplest way to express conditions:
-
-```go
-// Equality
-query := psql.B().Select().From("users").Where(map[string]any{"id": 123})
-
-// IS NULL
-query := psql.B().Select().From("users").Where(map[string]any{"deleted_at": nil})
-
-// IN (pass a slice)
-query := psql.B().Select().From("users").Where(map[string]any{"id": []int{1, 2, 3}})
-
-// OR conditions for same field
-query := psql.B().Select().From("users").Where(map[string]any{
-    "status": psql.WhereOR{"active", "pending"},
-})
-```
-
-### Comparison Operators
-
-```go
-psql.Equal(psql.F("status"), "active")    // status = 'active'
-psql.Lt(psql.F("age"), 18)                // age < 18
-psql.Lte(psql.F("age"), 65)               // age <= 65
-psql.Gt(psql.F("age"), 18)                // age > 18
-psql.Gte(psql.F("age"), 18)               // age >= 18
-psql.Between(psql.F("age"), 18, 65)       // age BETWEEN 18 AND 65
-&psql.Not{V: value}                        // negation (!=, IS NOT NULL, NOT LIKE)
-&psql.Like{Field: psql.F("name"), Like: "John%"}                          // standalone: name LIKE 'John%'
-&psql.Like{Field: psql.F("name"), Like: "john%", CaseInsensitive: true}   // standalone: case-insensitive
-psql.CILike(psql.F("name"), "john%")                                      // shorthand for above
-```
-
-When used as a map value, the `Field` is taken from the map key — omit it:
-
-```go
-Where(map[string]any{
-    "name": psql.Like{Like: "John%"},                          // LIKE
-    "name": psql.Like{Like: "john%", CaseInsensitive: true},   // case-insensitive LIKE
-})
-```
-
-### Multiple Conditions
-
-```go
-// Multiple arguments are joined with AND
-query := psql.B().Select().From("users").Where(
-    psql.Equal(psql.F("status"), "active"),
-    psql.Gte(psql.F("age"), 18),
-)
-```
-
-### Subqueries
-
-Use `SubIn` for IN (subquery) conditions:
-
-```go
-// WHERE "id" IN (SELECT "user_id" FROM "orders")
-query := psql.B().Select().From("users").Where(map[string]any{
-    "id": &psql.SubIn{Sub: psql.B().Select("user_id").From("orders")},
-})
-
-// NOT IN subquery
-query := psql.B().Select().From("users").Where(map[string]any{
-    "id": &psql.Not{V: &psql.SubIn{Sub: psql.B().Select("user_id").From("banned")}},
-})
-```
-
-### Any (PostgreSQL-Optimized Array Comparison)
-
-On PostgreSQL with parameterized queries, `Any` uses `= ANY($N)` passing the slice as a single array parameter. On MySQL/SQLite it expands to `IN(...)`:
-
-```go
-query := psql.B().Select().From("users").Where(map[string]any{
-    "id": &psql.Any{Values: []int64{1, 2, 3}},
-})
-```
-
-## ORDER BY and LIMIT
-
-```go
-query := psql.B().Select().From("users").
-    OrderBy(psql.S("created_at", "DESC"), psql.S("name", "ASC")).
-    Limit(10)
-
-// With offset
-query := psql.B().Select().From("users").
-    OrderBy(psql.S("created_at", "DESC")).
-    Limit(10, 20)
-// MySQL:      LIMIT 10, 20
-// PostgreSQL: LIMIT 10 OFFSET 20
-```
-
-## JOINs
-
-```go
-// INNER JOIN
-query := psql.B().
-    Select(psql.F("users", "name"), psql.F("orders", "total")).
-    From("users").
-    InnerJoin("orders", psql.Equal(psql.F("users.id"), psql.F("orders.user_id")))
-
-// LEFT JOIN
-query := psql.B().
-    Select().From("users").
-    LeftJoin("profiles", psql.Equal(psql.F("users.id"), psql.F("profiles.user_id")))
-
-// RIGHT JOIN
-query := psql.B().
-    Select().From("users").
-    RightJoin("orders", psql.Equal(psql.F("users.id"), psql.F("orders.user_id")))
-```
-
-## GROUP BY and HAVING
-
-```go
-query := psql.B().
-    Select("status", psql.Raw("COUNT(*)")).
-    From("users").
-    GroupByFields("status")
-
-query := psql.B().
-    Select("status", psql.Raw("COUNT(*) as cnt")).
-    From("users").
-    GroupByFields("status").
-    Having(psql.Gt(psql.Raw("COUNT(*)"), 5))
-```
-
-## DISTINCT
-
-```go
-query := psql.B().Select("name").From("users").SetDistinct()
-// SELECT DISTINCT "name" FROM "users"
-```
-
-## FOR UPDATE
-
-```go
-query := psql.B().Select().From("users").Where(...).SetForUpdate()
-// SELECT ... FOR UPDATE
-
-query := psql.B().Select().From("users").Where(...).SetSkipLocked()
-// SELECT ... FOR UPDATE SKIP LOCKED
-
-query := psql.B().Select().From("users").Where(...).SetNoWait()
-// SELECT ... FOR UPDATE NOWAIT
-```
-
-FOR UPDATE is silently omitted on SQLite (which uses file/WAL-level locking).
-
-## ON CONFLICT (Upsert)
-
-```go
-// INSERT ... ON CONFLICT DO NOTHING
-query := psql.B().Insert().Into("users").
-    Set(map[string]any{"id": 1, "name": "Alice"}).
-    DoNothing()
-
-// INSERT ... ON CONFLICT (id) DO UPDATE SET name=...
-query := psql.B().Insert().Into("users").
-    Set(map[string]any{"id": 1, "name": "Alice"}).
-    OnConflict("id").
-    DoUpdate(map[string]any{"name": "Alice"})
-```
-
-## Portable Timestamp Arithmetic
-
-`Now()`, `DateAdd()`, and `DateSub()` generate engine-appropriate SQL for timestamp operations, so you never need to write raw `INTERVAL` expressions:
-
-```go
-// Portable NOW()
-psql.Now()
-// MySQL/PostgreSQL: NOW()
-// SQLite:           CURRENT_TIMESTAMP
-
-// Add a duration to a timestamp
-psql.DateAdd(psql.F("created_at"), 24*time.Hour)
-// MySQL:      "created_at" + INTERVAL 1 DAY
-// PostgreSQL: "created_at" + INTERVAL '1 day'
-// SQLite:     datetime("created_at",'+1 days')
-
-// Subtract a duration
-psql.DateSub(psql.Now(), 30*time.Minute)
-// MySQL:      NOW() - INTERVAL 30 MINUTE
-// PostgreSQL: NOW() - INTERVAL '30 minute'
-// SQLite:     datetime(CURRENT_TIMESTAMP,'-30 minutes')
-```
-
-Durations are automatically decomposed into the largest clean unit (day, hour, minute, second). Sub-second precision uses microseconds on MySQL/PostgreSQL.
-
-### Common Patterns
-
-```go
-// Records created in the last 24 hours
-query := psql.B().Select().From("events").
-    Where(psql.Gt(psql.F("created_at"), psql.DateSub(psql.Now(), 24*time.Hour)))
-
-// Sessions expiring within 2 hours
-query := psql.B().Select().From("sessions").
-    Where(psql.Lt(psql.F("expires_at"), psql.DateAdd(psql.Now(), 2*time.Hour)))
-
-// Deadline passed 1 hour ago
-query := psql.B().Select().From("tasks").
-    Where(psql.Lt(psql.DateAdd(psql.F("deadline"), 1*time.Hour), psql.Now()))
-
-// Use in SELECT to compute a future timestamp
-query := psql.B().Select("id", psql.DateAdd(psql.F("created_at"), 7*24*time.Hour)).From("events")
-```
-
-## SET Expressions (UPDATE)
-
-### Increment / Decrement
-
-Atomically increment or decrement a field:
-
-```go
-psql.B().Update("counters").
-    Set(map[string]any{"views": psql.Incr(1)}).
-    Where(map[string]any{"id": 42})
-// UPDATE "counters" SET "views"="views"+1 WHERE "id"=42
-
-psql.B().Update("inventory").
-    Set(map[string]any{"stock": psql.Decr(1)}).
-    Where(map[string]any{"id": 42})
-// UPDATE "inventory" SET "stock"="stock"-1 WHERE "id"=42
-```
-
-### SetRaw
-
-Use raw SQL in a SET clause:
-
-```go
-psql.B().Update("users").
-    Set(map[string]any{"last_seen": &psql.SetRaw{SQL: "NOW()"}}).
-    Where(map[string]any{"id": 42})
-```
-
-## Scopes
-
-Apply reusable query modifiers:
-
-```go
-var Active psql.Scope = func(q *psql.QueryBuilder) *psql.QueryBuilder {
-    return q.Where(map[string]any{"Status": "active"})
-}
-
-query := psql.B().Select().From("users").Apply(Active)
-```
-
-See [Scopes & Lazy](scopes-lazy.md) for details.
-
-## Raw SQL
-
-For queries that don't fit the builder, use `psql.Q()`:
-
-```go
-err := psql.Q(`DROP TABLE IF EXISTS "old_table"`).Exec(ctx)
-```
+Tables are given as strings to `From`, `Table`, `Update`, `InsertSelect` and
+the join methods; a string may carry an alias (`"users AS u"` or `"users u"`),
+rendered as `"users" AS "u"`. `Into` and `Replace` take a
+`psql.EscapeTableable` (such as `psql.SubTable`, or your own implementation
+of `EscapeTable() string`), not a string: use `.Table("users")` for a plain
+table name.
 
 ## Executing Queries
 
 ```go
-// Get the SQL string
-sql, err := query.Render(ctx)
+rows, err := q.RunQuery(ctx)   // SELECT: *sql.Rows, caller must Close()
+res, err := q.ExecQuery(ctx)   // INSERT/UPDATE/DELETE: sql.Result
+stmt, err := q.Prepare(ctx)    // prepared statement, caller must Close()
 
-// Get SQL with placeholders and arguments
-sql, args, err := query.RenderArgs(ctx)
+users, err := psql.RunQueryT[User](ctx, q)    // scan every row into []*User
+user, err := psql.RunQueryTOne[User](ctx, q)  // first row, or os.ErrNotExist
 
-// Execute SELECT (returns rows)
-rows, err := query.RunQuery(ctx)
-defer rows.Close()
-
-// Execute INSERT/UPDATE/DELETE (returns result)
-result, err := query.ExecQuery(ctx)
-
-// Prepare a statement
-stmt, err := query.Prepare(ctx)
-defer stmt.Close()
+sql, args, err := q.RenderArgs(ctx) // parameterized SQL + arguments
+sql, err = q.Render(ctx)            // SQL with values embedded as literals
 ```
 
-### Typed Query Execution
+`RenderArgs` is what every execution path uses: values become `?`
+placeholders (MySQL, SQLite) or `$1, $2, ...` (PostgreSQL) and are passed to
+the driver. `Render` embeds the values as engine-aware literals and is meant
+for logging and debugging. Both return an error if the query cannot be
+rendered (bare string condition, unsupported operator, vector operator on an
+engine without vector support, ...). `RunQuery` failures are returned as a
+`*psql.Error` carrying the rendered query.
 
-Scan query results directly into typed structs:
+## Helper Functions
+
+| Helper | Meaning |
+|--------|---------|
+| `psql.F("col")`, `psql.F("t.col")`, `psql.F("t", "col")`, `psql.F("t.*")` | Field reference, quoted |
+| `psql.S("col", "DESC")`, `psql.S("t", "col", "ASC")` | Sort field for `OrderBy` and `psql.Sort` (direction optional) |
+| `psql.V(value)` | Force a value to be treated as a literal, never as an expression or list |
+| `psql.Raw("COUNT(*)")` | Raw SQL, inserted verbatim (never with user input) |
+| `psql.Now()`, `psql.DateAdd(expr, d)`, `psql.DateSub(expr, d)` | Portable timestamp expressions |
+| `psql.Coalesce(a, b, ...)`, `psql.Greatest(...)`, `psql.Least(...)` | Functions (`GREATEST`/`LEAST` become `MAX`/`MIN` on SQLite) |
+| `psql.Case()...`, `psql.Case(operand)...` | `CASE WHEN ... THEN ... ELSE ... END` |
+| `psql.Exists(sub)`, `psql.NotExists(sub)` | `EXISTS (subquery)` |
+| `psql.SubTable(sub, "alias")` | Derived table for `From`/`Join` |
+| `psql.Escape(v)` | Render any value as an engine-neutral SQL literal |
+
+## WHERE Conditions
+
+`Where` accepts any number of conditions, joined with `AND`. Each condition
+is a `map[string]any`, a comparison expression, a `psql.WhereOR` /
+`psql.WhereAND`, or a `psql.Raw`. **Bare strings are rejected** (the query
+fails to render) because they would otherwise be bound as values; wrap raw
+SQL in `psql.Raw`.
+
+### Map syntax
+
+Keys are column names, values decide the operator:
 
 ```go
-// Scan all rows into []*User
-users, err := psql.RunQueryT[User](ctx, query)
-
-// Scan a single row into *User (returns os.ErrNotExist if no rows)
-user, err := psql.RunQueryTOne[User](ctx, query)
+psql.B().Select().From("users").Where(map[string]any{
+    "id":         123,                                   // "id"=?
+    "deleted_at": nil,                                   // "deleted_at" IS NULL
+    "role":       []string{"admin", "staff"},            // "role" IN(?,?)   (any slice)
+    "status":     psql.WhereOR{"active", "pending"},     // ("status"=? OR "status"=?)
+    "age":        map[string]any{"$gte": 18, "$lt": 65}, // ("age">=? AND "age"<?)
+    "name":       psql.Like{Like: "Jo%"},                // "name" LIKE ? ESCAPE '\'
+    "email":      psql.Like{Like: "%@example.com", CaseInsensitive: true},
+    "tags":       &psql.FindInSet{Value: "go"},          // element of a comma-separated list
+    "score":      &psql.Not{V: nil},                     // "score" IS NOT NULL
+    "team":       &psql.Not{V: []int{1, 2}},             // "team" NOT IN(?,?)
+    "owner":      &psql.SubIn{Sub: psql.B().Select("user_id").From("orders")}, // IN (SELECT ...)
+    "region":     &psql.Any{Values: []string{"eu", "us"}},                      // = ANY($n) on PostgreSQL, IN(...) elsewhere
+})
 ```
 
-## Complete Examples
+Several conditions on the same column combine with `psql.WhereAND{...}` or
+`psql.WhereOR{...}` as the value. An empty slice, `WhereOR` or `Any` never
+matches (`FALSE`); an empty `WhereAND` or empty map matches everything.
+Values implementing `driver.Valuer` (`psql.Set`, `psql.Vector`, `psql.Hex`,
+`psql.V(...)`) and `[]byte` are always compared as a single value, even
+though they are slices.
+
+Map keys are rendered in sorted order so that identical maps produce
+identical SQL (prepared statement caches hit).
+
+### Expressions
 
 ```go
-// Find active users older than 18, ordered by name
-users := psql.B().
-    Select("id", "name", "email").
+psql.Equal(psql.F("status"), "active")          // "status"=?
+psql.Equal(psql.F("manager_id"), nil)           // "manager_id" IS NULL
+psql.Gt(psql.F("age"), 18)                      // "age">?     (Gte, Lt, Lte likewise)
+psql.Between(psql.F("age"), 18, 65)             // "age" BETWEEN ? AND ?
+psql.CILike(psql.F("name"), "john%")            // ILIKE / LOWER() LIKE LOWER() / LIKE per engine
+&psql.Like{Field: psql.F("name"), Like: "John%"}
+&psql.FindInSet{Field: psql.F("tags"), Value: "go"}
+&psql.Not{V: psql.Equal(psql.F("a"), 1)}        // NOT ("a"=?)
+psql.Raw(`"a" = "b" + 1`)                       // raw SQL
+```
+
+Multiple top-level conditions:
+
+```go
+psql.B().Select().From("users").Where(
+    psql.Equal(psql.F("status"), "active"),
+    psql.Gte(psql.F("age"), 18),
+    psql.WhereOR{
+        map[string]any{"role": "admin"},
+        psql.Equal(psql.F("verified"), true),
+    },
+)
+// WHERE ("status"=?) AND ("age">=?) AND (("role"=?) OR ("verified"=?))
+```
+
+Case-insensitive `LIKE` renders as `ILIKE` on PostgreSQL, `LOWER(f) LIKE
+LOWER(p)` on SQLite and a plain `LIKE` on MySQL (whose default collations
+are case-insensitive). Patterns use `\` as the escape character.
+
+### Subqueries
+
+```go
+// IN (SELECT ...)
+psql.B().Select().From("users").Where(map[string]any{
+    "id": &psql.SubIn{Sub: psql.B().Select("user_id").From("orders")},
+})
+
+// EXISTS (SELECT 1 FROM "orders" WHERE "orders"."user_id"="users"."id")
+psql.B().Select().From("users").Where(
+    psql.Exists(psql.B().Select(psql.Raw("1")).From("orders").Where(
+        psql.Equal(psql.F("orders.user_id"), psql.F("users.id")),
+    )),
+)
+
+// scalar subquery in SELECT
+psql.B().Select("id", psql.Coalesce(
+    psql.B().Select(psql.Raw("COUNT(*)")).From("orders").Where(psql.Equal(psql.F("orders.user_id"), psql.F("users.id"))),
+    0,
+)).From("users")
+```
+
+Subqueries share the parent's argument list, so placeholders are numbered
+correctly on PostgreSQL.
+
+## ORDER BY, LIMIT and OFFSET
+
+```go
+psql.B().Select().From("users").
+    OrderBy(psql.S("created_at", "DESC"), psql.S("name", "ASC")).
+    Limit(10)
+// ... ORDER BY "created_at" DESC,"name" ASC LIMIT 10
+
+psql.B().Select().From("users").OrderBy(psql.S("id")).Limit(20, 10)
+// ... ORDER BY "id" LIMIT 10 OFFSET 20
+```
+
+`Limit(count)` renders `LIMIT count`. `Limit(offset, count)` follows the
+MySQL argument order (offset first, like `psql.LimitFrom(offset, count)`) and
+renders `LIMIT count OFFSET offset` on every engine. `Limit()` with no
+argument clears the clause. PostgreSQL does not support `LIMIT` on `DELETE`
+and `UPDATE`; rendering such a query returns an error.
+
+## JOINs
+
+```go
+psql.B().
+    Select(psql.F("u", "name"), psql.F("o", "total")).
+    From("users AS u").
+    InnerJoin("orders o", psql.Equal(psql.F("u.id"), psql.F("o.user_id"))).
+    LeftJoin("profiles", psql.Equal(psql.F("u.id"), psql.F("profiles.user_id"))).
+    RightJoin("teams", map[string]any{"teams.id": psql.Raw(`"u"."team_id"`)})
+```
+
+`Join(joinType, table, conditions...)` is the general form; conditions
+accept the same values as `Where` and are joined with `AND`. Join a derived
+table with `psql.SubTable`:
+
+```go
+psql.B().Select("u.id", "vc.vote_count").From("users AS u").LeftJoin(
+    psql.SubTable(
+        psql.B().Select("user_id", psql.Raw("COUNT(*) AS vote_count")).From("votes").GroupByFields("user_id"),
+        "vc",
+    ),
+    psql.Equal(psql.F("u.id"), psql.F("vc.user_id")),
+)
+```
+
+## GROUP BY, HAVING, DISTINCT
+
+```go
+psql.B().
+    Select("status", psql.Raw("COUNT(*) AS cnt")).
     From("users").
-    Where(
-        psql.Equal(psql.F("status"), "active"),
-        psql.Gt(psql.F("age"), 18),
-    ).
-    OrderBy(psql.S("name", "ASC")).
-    Limit(50)
+    GroupByFields("status").
+    Having(psql.Gt(psql.Raw("COUNT(*)"), 5))
 
-// Update user's last login
-update := psql.B().
-    Update("users").
-    Set(map[string]any{
-        "last_login":  time.Now(),
-        "login_count": psql.Incr(1),
-    }).
-    Where(map[string]any{"id": userID})
-
-// Complex search with case-insensitive matching
-search := psql.B().
-    Select().
-    From("products").
-    Where(map[string]any{
-        "status":      "available",
-        "name":        psql.Like{Like: "%" + searchTerm + "%", CaseInsensitive: true},
-        "category_id": psql.WhereOR{1, 2, 3},
-    }).
-    OrderBy(psql.S("price", "ASC"))
+psql.B().Select("name").From("users").SetDistinct() // SELECT DISTINCT "name" ...
 ```
+
+## Locking
+
+```go
+psql.B().Select().From("jobs").Where(map[string]any{"state": "queued"}).SetForUpdate()   // FOR UPDATE
+psql.B().Select().From("jobs").Where(map[string]any{"state": "queued"}).SetSkipLocked()  // FOR UPDATE SKIP LOCKED
+psql.B().Select().From("jobs").Where(map[string]any{"state": "queued"}).SetNoWait()      // FOR UPDATE NOWAIT
+```
+
+`FOR UPDATE` is silently omitted on SQLite, which locks at the database
+level. The fetch options `psql.FetchLock`, `psql.FetchLockSkipLocked` and
+`psql.FetchLockNoWait` set the same flags.
+
+## INSERT and Upserts
+
+```go
+// INSERT ... ON CONFLICT DO NOTHING / INSERT IGNORE / INSERT OR IGNORE
+psql.B().Insert().Table("users").
+    Set(map[string]any{"id": 1, "name": "Alice"}).
+    DoNothing()
+
+// PostgreSQL/SQLite: INSERT ... ON CONFLICT ("id") DO UPDATE SET "name"=?
+// MySQL:             INSERT ... ON DUPLICATE KEY UPDATE "name"=?
+psql.B().Insert().Table("users").
+    Set(map[string]any{"id": 1, "name": "Alice"}).
+    OnConflict("id").
+    DoUpdate(map[string]any{"name": "Alice"})
+
+// INSERT INTO "archive" SELECT "id","name" FROM "users" WHERE ("active"=?)
+psql.B().InsertSelect("archive").Select("id", "name").From("users").
+    Where(map[string]any{"active": false})
+```
+
+`DoUpdate` requires `OnConflict` columns on PostgreSQL and SQLite (rendering
+fails without them); MySQL ignores them.
+
+## SET Expressions
+
+`Set` (and `DoUpdate`) take `map[string]any` entries or `psql.Raw`
+expressions; bare strings are rejected. Values are always bound as a single
+value (slices and `driver.Valuer`s included), and three wrappers expand
+into expressions:
+
+```go
+psql.B().Update("counters").
+    Set(map[string]any{
+        "views":     psql.Incr(1),                       // "views"="views"+(?)
+        "stock":     psql.Decr(1),                       // "stock"="stock"-(?)
+        "last_seen": &psql.SetRaw{SQL: "NOW()"},         // "last_seen"=NOW()
+        "expires":   psql.DateAdd(psql.Now(), time.Hour), // engine-specific interval
+    }).
+    Where(map[string]any{"id": 42})
+```
+
+## Portable Timestamp Arithmetic
+
+`psql.Now()`, `psql.DateAdd(expr, d)` and `psql.DateSub(expr, d)` render
+per engine:
+
+```go
+psql.DateSub(psql.Now(), 24*time.Hour)
+// MySQL:      NOW() - INTERVAL 1 DAY
+// PostgreSQL: NOW() - INTERVAL '1 day'
+// SQLite:     datetime(CURRENT_TIMESTAMP,'-1 days')
+
+psql.DateAdd(psql.F("created_at"), 90*time.Minute)
+// MySQL:      "created_at" + INTERVAL 90 MINUTE
+// PostgreSQL: "created_at" + INTERVAL '90 minute'
+// SQLite:     datetime("created_at",'+90 minutes')
+```
+
+The duration is expressed in the largest unit that divides it exactly
+(day, hour, minute, second), or in microseconds below one second.
+
+```go
+// rows created in the last 24 hours
+psql.B().Select().From("events").
+    Where(psql.Gt(psql.F("created_at"), psql.DateSub(psql.Now(), 24*time.Hour)))
+```
+
+## Scopes
+
+```go
+var Active psql.Scope = func(q *psql.QueryBuilder) *psql.QueryBuilder {
+    return q.Where(map[string]any{"status": "active"})
+}
+
+q := psql.B().Select().From("users").Apply(Active)
+```
+
+See [Scopes & Lazy](scopes-lazy.md).
+
+## Raw SQL
+
+```go
+err := psql.Q(`DROP TABLE IF EXISTS "old_table"`).Exec(ctx)
+
+err = psql.Q(`SELECT "id","name" FROM "users" WHERE "age" > ?`, 18).Each(ctx, func(rows *sql.Rows) error {
+    var id int64
+    var name string
+    if err := rows.Scan(&id, &name); err != nil {
+        return err
+    }
+    if id > 100 {
+        return psql.ErrBreakLoop // stop without error
+    }
+    return nil
+})
+
+users, err := psql.QT[User](`SELECT * FROM "users" WHERE "age" > ?`, 18).All(ctx)
+user, err := psql.QT[User](`SELECT * FROM "users" WHERE "id" = ?`, 1).Single(ctx) // os.ErrNotExist if none
+```
+
+Raw queries run against whatever the context carries (transaction,
+connection or backend) and must use the engine's placeholder style
+(`?` or `$1`). `psql.ExecContext(ctx, sql, args...)` is the lowest-level
+equivalent.
