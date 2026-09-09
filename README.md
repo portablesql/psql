@@ -74,15 +74,23 @@ import _ "github.com/portablesql/psql-sqlite"  // SQLite (pure Go)
   or never). Generic `Insert`, `Get`, `Fetch`, `Update`, `Replace`, `Delete`,
   `Count`, iterators, change tracking. See [Object Binding](docs/object-binding.md).
 - **Query builder**: `psql.B().Select().From().Where()...` with map or
-  expression conditions, joins, subqueries, upserts, locking and portable
-  date arithmetic, rendered with placeholders for the target engine. See
+  expression conditions, joins, subqueries, CTEs, upserts, multi-row
+  inserts, `RETURNING`, row lock modes, `EXPLAIN` and portable date
+  arithmetic, rendered with placeholders for the target engine. See
   [Query Builder](docs/query-builder.md).
+- **Advanced features**: product detection (`be.Variant()`,
+  `be.Supports(feature)`), `DISTINCT ON`, CockroachDB `AS OF SYSTEM TIME`,
+  JSON and full-text expressions with GIN/GIST keys, named locks, identity
+  columns (`autoinc`), transaction options with automatic retries and
+  `BulkInsert` (`COPY` on PostgreSQL). Features a product lacks fail with
+  `psql.ErrNotSupported`. See [Advanced features](docs/advanced.md).
 - **Hooks**: `BeforeSave`, `AfterInsert`, `AfterScan`, ... as methods on
   your types. See [Hooks](docs/hooks.md).
 - **Associations**: `belongs_to`, `has_one`, `has_many`, `many_to_many`
   with batched preloading. See [Associations](docs/associations.md).
-- **Transactions**: context-based, nested through savepoints, with an
-  escape hatch for audit logs. See [Transactions](docs/transactions.md).
+- **Transactions**: context-based, nested through savepoints, retried on
+  serialization failures and deadlocks, with an escape hatch for audit
+  logs. See [Transactions](docs/transactions.md).
 - **Soft delete**: a `DeletedAt *time.Time` field turns `Delete` into an
   update and filters reads. See [Soft Delete](docs/soft-delete.md).
 - **Scopes and lazy loading**: reusable query modifiers, and futures that
@@ -98,10 +106,11 @@ import _ "github.com/portablesql/psql-sqlite"  // SQLite (pure Go)
 |-------|-------------|
 | [Getting Started](docs/getting-started.md) | Installation, drivers and DSNs, context, errors, pooling, logging, thread safety |
 | [Object Binding](docs/object-binding.md) | Struct tags, column types, keys, enums, schema management, CRUD and fetch options |
-| [Query Builder](docs/query-builder.md) | SELECT, WHERE, JOIN, GROUP BY, subqueries, upserts, raw SQL |
+| [Query Builder](docs/query-builder.md) | SELECT, WHERE, JOIN, GROUP BY, CTEs, subqueries, upserts, RETURNING, locking, raw SQL |
+| [Advanced features](docs/advanced.md) | Feature matrix per product, PostgreSQL/CockroachDB extensions, JSON, full-text, named locks, autoinc, retries, bulk insert, dialect interfaces |
 | [Hooks](docs/hooks.md) | Lifecycle callbacks and their order |
 | [Associations](docs/associations.md) | belongs_to, has_one, has_many, many_to_many, preloading |
-| [Transactions](docs/transactions.md) | Transactions, savepoints, running queries outside a transaction |
+| [Transactions](docs/transactions.md) | Transactions, options and retries, savepoints, named locks, running queries outside a transaction |
 | [Soft Delete](docs/soft-delete.md) | Soft delete, restore, force delete |
 | [Scopes & Lazy](docs/scopes-lazy.md) | Scopes, lazy futures and batches, change detection |
 | [Vectors](docs/vectors.md) | Vector columns and similarity search |

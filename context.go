@@ -70,7 +70,7 @@ type TxOptions struct {
 	MaxRetries int
 	// Backoff returns how long to wait before retry attempt (1 for the first
 	// retry). nil uses an exponential backoff with jitter starting around
-	// 10ms and capped at one second.
+	// 10ms, capped at one second before a random jitter of up to 50% is applied.
 	Backoff func(attempt int) time.Duration
 }
 

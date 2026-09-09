@@ -277,7 +277,7 @@ func (q *QueryBuilder) OnConflict(columns ...string) *QueryBuilder {
 // the row that would have been inserted; this renders correctly on every
 // engine and is the recommended way to write a portable upsert:
 //
-//	psql.B().Insert(map[string]any{"id": 1, "hits": 1}).Into("t").
+//	psql.B().Insert(map[string]any{"id": 1, "hits": 1}).Table("t").
 //	    OnConflict("id").DoUpdate(map[string]any{"hits": psql.Excluded("hits")})
 //
 // [QueryBuilder.DoUpdateWhere] restricts the update to matching rows.

@@ -50,8 +50,12 @@ placeholders (MySQL, SQLite) or `$1, $2, ...` (PostgreSQL) and are passed to
 the driver. `Render` embeds the values as engine-aware literals and is meant
 for logging and debugging. Both return an error if the query cannot be
 rendered (bare string condition, unsupported operator, vector operator on an
-engine without vector support, ...). `RunQuery` failures are returned as a
-`*psql.Error` carrying the rendered query.
+engine without vector support, ...); a clause the product lacks
+(`DistinctOn` on MySQL, `Returning` on MySQL, `AsOfSystemTime` outside
+CockroachDB) fails with an error wrapping `psql.ErrNotSupported`, which
+`be.Supports(feature)` predicts (see [Advanced features](advanced.md)).
+`RunQuery` failures are returned as a `*psql.Error` carrying the rendered
+query. `Explain(ctx, analyze)` returns the query plan as text.
 
 ## Helper Functions
 
@@ -67,6 +71,9 @@ engine without vector support, ...). `RunQuery` failures are returned as a
 | `psql.Exists(sub)`, `psql.NotExists(sub)` | `EXISTS (subquery)` |
 | `psql.SubTable(sub, "alias")` | Derived table for `From`/`Join` |
 | `psql.Escape(v)` | Render any value as an engine-neutral SQL literal |
+| `psql.Excluded("col")` | The value that would have been inserted, in `DoUpdate` (`EXCLUDED."col"` / `VALUES("col")`) |
+| `psql.JSONGet(f, path...)`, `psql.JSONGetText(...)`, `psql.JSONContains(f, v)`, `psql.JSONHasKey(f, key)`, `psql.JSONSet(f, path, v)` | JSON expressions, see [Advanced features](advanced.md#json-expressions) |
+| `psql.FullText(query, fields...)`, `psql.FullTextRank(...)` | Full-text match and relevance, see [Advanced features](advanced.md#full-text-search) |
 
 ## WHERE Conditions
 
@@ -217,7 +224,39 @@ psql.B().
     Having(psql.Gt(psql.Raw("COUNT(*)"), 5))
 
 psql.B().Select("name").From("users").SetDistinct() // SELECT DISTINCT "name" ...
+
+// PostgreSQL / CockroachDB only: first row per user, see advanced.md
+psql.B().Select("*").DistinctOn("user_id").From("events").
+    OrderBy(psql.S("user_id", "ASC"), psql.S("created", "DESC"))
+// SELECT DISTINCT ON ("user_id") * FROM "events" ORDER BY "user_id" ASC,"created" DESC
 ```
+
+`DistinctOn` fails with `psql.ErrNotSupported` on MySQL, MariaDB and
+SQLite.
+
+## Common Table Expressions
+
+`With(name, sub, columns...)` prefixes the query with a `WITH` clause; `sub`
+is a `*psql.QueryBuilder` or a `psql.Raw`. The CTE is then usable as a
+table in `From`, `Join` and subqueries, and its arguments are numbered
+before those of the main query. `WithRecursive` renders `WITH RECURSIVE`.
+
+```go
+active := psql.B().Select("id").From("users").Where(map[string]any{"active": true})
+psql.B().With("active_users", active).
+    Select("*").From("orders").
+    Where(map[string]any{"user_id": &psql.SubIn{Sub: psql.B().Select("id").From("active_users")}})
+// WITH "active_users" AS (SELECT "id" FROM "users" WHERE ("active"=$1))
+// SELECT * FROM "orders" WHERE ("user_id" IN (SELECT "id" FROM "active_users"))
+
+tree := psql.Raw(`SELECT "id","parent" FROM "nodes" WHERE "id"=1 UNION ALL SELECT n."id",n."parent" FROM "nodes" n JOIN "tree" t ON n."parent"=t."id"`)
+psql.B().WithRecursive("tree", tree, "id", "parent").Select("*").From("tree")
+// WITH RECURSIVE "tree" ("id","parent") AS (...) SELECT * FROM "tree"
+```
+
+CTEs work on every engine (MySQL 8.0+, MariaDB 10.2+) and also in front of
+`UPDATE`, `DELETE`, `INSERT` and `INSERT ... SELECT`. See
+[Advanced features](advanced.md#common-table-expressions).
 
 ## Locking
 
@@ -225,11 +264,43 @@ psql.B().Select("name").From("users").SetDistinct() // SELECT DISTINCT "name" ..
 psql.B().Select().From("jobs").Where(map[string]any{"state": "queued"}).SetForUpdate()   // FOR UPDATE
 psql.B().Select().From("jobs").Where(map[string]any{"state": "queued"}).SetSkipLocked()  // FOR UPDATE SKIP LOCKED
 psql.B().Select().From("jobs").Where(map[string]any{"state": "queued"}).SetNoWait()      // FOR UPDATE NOWAIT
+
+psql.B().Select().From("jobs").SetLockMode(psql.LockShare)                  // FOR SHARE (LOCK IN SHARE MODE on MariaDB / MySQL 5.7)
+psql.B().Select().From("jobs").SetLockMode(psql.LockNoKeyUpdate).SetSkipLocked() // FOR NO KEY UPDATE SKIP LOCKED (PostgreSQL)
+psql.B().Select().From("jobs j").Join("INNER", "users u", psql.Equal(psql.F("u.id"), psql.F("j.user_id"))).
+    LockOf("j").SetNoWait()                                                  // ... FOR UPDATE OF "j" NOWAIT
 ```
 
-`FOR UPDATE` is silently omitted on SQLite, which locks at the database
-level. The fetch options `psql.FetchLock`, `psql.FetchLockSkipLocked` and
-`psql.FetchLockNoWait` set the same flags.
+`SetLockMode` takes `psql.LockUpdate`, `psql.LockShare`,
+`psql.LockNoKeyUpdate` or `psql.LockKeyShare` (`SetForUpdate` is
+`SetLockMode(psql.LockUpdate)`); the two PostgreSQL-only modes fall back to
+`FOR UPDATE` / `FOR SHARE` on MySQL and MariaDB. `LockOf` restricts the lock
+to the listed tables and is not available on MariaDB and MySQL 5.7. Every
+lock clause is silently omitted on SQLite, which locks at the database
+level. The fetch options `psql.FetchLock`, `psql.FetchLockSkipLocked`,
+`psql.FetchLockNoWait`, `psql.FetchLockShare`, `psql.FetchLockNoKeyUpdate`,
+`psql.FetchLockKeyShare` and `psql.WithLock(mode, tables...)` set the same
+flags. The rendering per product is tabulated in
+[Advanced features](advanced.md#row-lock-modes).
+
+## AS OF SYSTEM TIME
+
+`AsOfSystemTime(expr)` reads from a historical snapshot on CockroachDB
+(`... FROM "orders" AS OF SYSTEM TIME '-10s' WHERE ...`); every other
+product fails with `psql.ErrNotSupported`. The fetch option
+`psql.AsOfSystemTime(expr)` does the same for `Fetch`, `Get` and `Count`.
+See [Advanced features](advanced.md#as-of-system-time-cockroachdb).
+
+## EXPLAIN
+
+```go
+plan, err := psql.B().Select().From("users").Where(map[string]any{"Email": "a@example.com"}).Explain(ctx, false)
+fmt.Println(plan) // one plan row per line
+```
+
+`Explain(ctx, analyze)` runs `EXPLAIN` (`EXPLAIN ANALYZE` with `analyze`,
+which really executes the query) on PostgreSQL, CockroachDB and MySQL,
+`EXPLAIN` / `ANALYZE` on MariaDB and `EXPLAIN QUERY PLAN` on SQLite.
 
 ## INSERT and Upserts
 
@@ -239,20 +310,59 @@ psql.B().Insert().Table("users").
     Set(map[string]any{"id": 1, "name": "Alice"}).
     DoNothing()
 
-// PostgreSQL/SQLite: INSERT ... ON CONFLICT ("id") DO UPDATE SET "name"=?
-// MySQL:             INSERT ... ON DUPLICATE KEY UPDATE "name"=?
+// PostgreSQL/SQLite: INSERT ... ON CONFLICT ("id") DO UPDATE SET "name"=EXCLUDED."name"
+// MySQL:             INSERT ... ON DUPLICATE KEY UPDATE "name"=VALUES("name")
 psql.B().Insert().Table("users").
     Set(map[string]any{"id": 1, "name": "Alice"}).
     OnConflict("id").
-    DoUpdate(map[string]any{"name": "Alice"})
+    DoUpdate(map[string]any{"name": psql.Excluded("name")})
 
 // INSERT INTO "archive" SELECT "id","name" FROM "users" WHERE ("active"=?)
 psql.B().InsertSelect("archive").Select("id", "name").From("users").
     Where(map[string]any{"active": false})
 ```
 
-`DoUpdate` requires `OnConflict` columns on PostgreSQL and SQLite (rendering
-fails without them); MySQL ignores them.
+`DoUpdate` requires `OnConflict` columns (or `OnConflictConstraint`) on
+PostgreSQL, CockroachDB and SQLite (rendering fails without them); MySQL
+ignores them. `psql.Excluded("col")` refers to the value that would have
+been inserted and renders correctly on every engine; plain values in
+`DoUpdate` are bound as usual. `OnConflictConstraint(name)` (PostgreSQL,
+CockroachDB) and `DoUpdateWhere(conds...)` (not MySQL/MariaDB) are
+described in [Advanced features](advanced.md#upserts-excluded-onconflictconstraint-doupdatewhere).
+
+### Multi-row inserts
+
+```go
+psql.B().InsertRows([]string{"id", "name"}, []any{1, "a"}, []any{2, "b"}).Table("users")
+// INSERT INTO "users" ("id","name") VALUES (?,?),(?,?)
+
+psql.B().Values(map[string]any{"id": 1, "name": "a"}, map[string]any{"id": 2, "name": "b"}).Table("users").
+    OnConflict("id").DoUpdate(map[string]any{"name": psql.Excluded("name")})
+```
+
+`InsertRows` takes a column list and one slice per row; `Values` takes maps
+sharing the same keys (columns are the sorted keys). Both render the
+column-list form on every engine, expand `psql.Raw` / `psql.Incr` values
+like `Set`, and accept the conflict clauses and `Returning`. They cannot be
+combined with `Insert` / `Set` values.
+
+### RETURNING
+
+```go
+users, err := psql.RunQueryT[User](ctx, psql.B().Update("users").
+    Set(map[string]any{"active": false}).
+    Where(map[string]any{"id": 42}).
+    Returning("*"))
+// UPDATE "users" SET "active"=$1 WHERE ("id"=$2) RETURNING *
+```
+
+`Returning(fields...)` (column names, `"*"` or expressions) applies to
+`INSERT`, `INSERT ... SELECT`, `UPDATE`, `DELETE` and `REPLACE`; read the
+rows with `RunQuery` or `RunQueryT`. Supported on PostgreSQL, CockroachDB
+and SQLite; on MariaDB for `INSERT`, `REPLACE` and `DELETE` only; not on
+MySQL, where rendering fails with `psql.ErrNotSupported`
+(`be.Supports(psql.FeatureReturning)` tells in advance). See
+[Advanced features](advanced.md#returning).
 
 ## SET Expressions
 

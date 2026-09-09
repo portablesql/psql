@@ -39,10 +39,24 @@
 // [QueryBuilder.Where]; [B] starts a query builder for anything else, and
 // [Q] / [QT] run raw SQL.
 //
+// Beyond the portable core, the builder renders RETURNING, common table
+// expressions ([QueryBuilder.With]), multi-row inserts
+// ([QueryBuilder.InsertRows]), row lock modes ([QueryBuilder.SetLockMode]),
+// DISTINCT ON, CockroachDB's AS OF SYSTEM TIME and EXPLAIN, plus JSON
+// ([JSONGet], [JSONContains], [JSONSet]) and full-text ([FullText])
+// expressions. Objects gain identity columns (the autoinc tag attribute),
+// [BulkInsert], named locks ([NamedLock]) and transactions with options and
+// automatic retries ([TxWithOptions]). [Backend.Variant] names the product
+// behind the engine (PostgreSQL or CockroachDB, MySQL or MariaDB) and
+// [Backend.Supports] reports which Feature* constants it has; a feature the
+// product lacks fails with an error wrapping [ErrNotSupported]. The
+// per-product feature matrix is in docs/advanced.md.
+//
 // The detailed reference lives in the docs directory of the repository
 // (https://github.com/portablesql/psql/tree/master/docs): getting-started.md
 // (drivers, DSNs, errors, pooling, logging, thread safety), object-binding.md
 // (tags, types, keys, schema management, fetch options and iterators),
-// query-builder.md, hooks.md, associations.md, transactions.md,
-// soft-delete.md, scopes-lazy.md, vectors.md and naming-strategies.md.
+// query-builder.md, advanced.md, hooks.md, associations.md,
+// transactions.md, soft-delete.md, scopes-lazy.md, vectors.md and
+// naming-strategies.md.
 package psql

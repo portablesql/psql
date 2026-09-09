@@ -300,10 +300,19 @@ func (t *TableMeta[T]) bulkBatch(ctx context.Context, be *Backend, bt *boundTabl
 		logQueryError(ctx, "psql:bulk_insert:run_fail", bt.name, req, err)
 		return &Error{Query: req, Err: err}
 	}
-	if engine == EngineMySQL && shape.omitAutoInc && !o.ignore {
+	if engine == EngineMySQL && !o.ignore {
 		// InnoDB allocates the ids of one multi-row statement consecutively
 		// and LastInsertId reports the first one
-		t.applyBulkInsertIds(res, bt.autoInc, rows)
+		switch {
+		case shape.omitAutoInc:
+			t.applyBulkInsertIds(res, bt.autoInc, rows)
+		case bt.autoInc == nil:
+			// legacy heuristic: a zero single-integer primary key was sent as
+			// 0, which an AUTO_INCREMENT column replaces with generated ids
+			if k := t.autoIncrementField(bt); k != nil && allZeroField(k, rows) {
+				t.applyBulkInsertIds(res, k, rows)
+			}
+		}
 	}
 	return nil
 }
@@ -355,4 +364,14 @@ func (t *TableMeta[T]) applyBulkInsertIds(res sql.Result, f *StructField, target
 			st.val[f.Index] = reflect.ValueOf(target).Elem().Field(f.Index).Interface()
 		}
 	}
+}
+
+// allZeroField reports whether field f is zero on every target.
+func allZeroField[T any](f *StructField, targets []*T) bool {
+	for _, target := range targets {
+		if !reflect.ValueOf(target).Elem().Field(f.Index).IsZero() {
+			return false
+		}
+	}
+	return true
 }

@@ -22,6 +22,78 @@ err := psql.Tx(ctx, func(ctx context.Context) error {
 (the callback's error is returned). A panic in the callback also rolls back,
 through the deferred `Rollback`.
 
+`psql.Tx` is `psql.TxWithOptions(ctx, nil, cb)`: it may **re-run the
+callback** after a retryable failure (see [Retries](#retries) below), so
+the callback should not have side effects outside the database.
+
+## Options and Retries
+
+```go
+opts := &psql.TxOptions{
+    Isolation:  sql.LevelSerializable, // passed to database/sql
+    ReadOnly:   false,
+    MaxRetries: 5,                     // 0: psql.DefaultTxRetries (3), negative: no retry
+    Backoff:    nil,                   // func(attempt int) time.Duration; nil: ~10ms doubling, jittered, capped at 1s
+}
+err := psql.TxWithOptions(ctx, opts, func(ctx context.Context) error {
+    from, err := psql.Get[Account](ctx, map[string]any{"ID": int64(1)}, psql.FetchLock)
+    if err != nil {
+        return err
+    }
+    from.Balance -= 10
+    return psql.Update(ctx, from)
+})
+if errors.Is(err, psql.ErrTxRetriesExhausted) {
+    // every attempt failed with a retryable error; errors.As still reaches the driver error
+}
+```
+
+### Retries
+
+A top-level transaction whose callback or commit fails with an error the
+backend's dialect reports as *retryable* (`psql.IsRetryable`: serialization
+failures and deadlocks, SQLSTATE `40001`/`40P01` on PostgreSQL, "restart
+transaction" on CockroachDB, errors 1213/1205 on MySQL and MariaDB,
+"database is locked" on SQLite) is rolled back and, after the backoff, the
+callback runs again with a fresh transaction, up to `MaxRetries` times.
+Everything the callback did inside the transaction is discarded by the
+rollback; everything else (emails, messages, in-memory state, results
+captured in outer variables) is repeated, so the callback must be
+idempotent or reset such state at its start. Once the retries are
+exhausted the last error is returned wrapped with
+`psql.ErrTxRetriesExhausted`; a cancelled context stops the wait.
+
+Nested transactions (savepoints) never retry: the error propagates so the
+outer, top-level transaction can retry as a whole. `Isolation` and
+`ReadOnly` are ignored for nested transactions too.
+
+## Named Locks
+
+`psql.NamedLock` and `psql.WithNamedLock` take a cooperative, server-wide
+lock on a name (`GET_LOCK` on MySQL/MariaDB, `pg_advisory_xact_lock` on
+PostgreSQL) to serialize jobs or migrations across processes:
+
+```go
+err := psql.WithNamedLock(ctx, "migrate", 30*time.Second, func(ctx context.Context) error {
+    return runMigrations(ctx) // ctx carries the transaction holding the lock
+})
+if errors.Is(err, psql.ErrLockTimeout) {
+    // someone else held the lock for more than 30s
+}
+
+release, err := psql.NamedLock(ctx, "nightly-report", 0) // 0: wait forever, negative: do not wait
+if err != nil {
+    return err // psql.ErrNotSupported on SQLite and CockroachDB
+}
+defer release() // exactly once
+```
+
+When `ctx` already carries a transaction the lock is taken inside it (and,
+on PostgreSQL, released with it); otherwise `NamedLock` pins a connection
+until `release`, and `WithNamedLock` opens a transaction around `fn`.
+`be.Supports(psql.FeatureAdvisoryLocks)` tells whether the product has
+named locks. See [Advanced features](advanced.md#named-locks).
+
 ## Manual Style
 
 ```go
@@ -66,7 +138,8 @@ err := psql.Tx(ctx, func(ctx context.Context) error {
 
 - The nested `BeginTx` issues `SAVEPOINT Ln`; its `Commit` issues `RELEASE
   SAVEPOINT Ln` and its `Rollback` issues `ROLLBACK TO SAVEPOINT Ln`. The
-  `*sql.TxOptions` of a nested transaction are ignored.
+  `*sql.TxOptions` (or `psql.TxOptions`) of a nested transaction are
+  ignored, and a nested `Tx` / `TxWithOptions` is never retried.
 - Nested transactions must be finished innermost first. Committing or
   rolling back an outer `TxProxy` while an inner one is still open returns
   an error ("nested transaction(s) still open") and leaves the transaction

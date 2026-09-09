@@ -135,7 +135,7 @@ func (ctx *renderContext) notSupported(what string) error {
 // [QueryBuilder.DoUpdate] with Excluded values the portable way to write an
 // upsert:
 //
-//	psql.B().Insert(map[string]any{"id": 1, "hits": 1, "name": "x"}).Into("t").
+//	psql.B().Insert(map[string]any{"id": 1, "hits": 1, "name": "x"}).Table("t").
 //	    OnConflict("id").
 //	    DoUpdate(map[string]any{"hits": psql.Excluded("hits"), "name": psql.Excluded("name")})
 //	// PostgreSQL: ... ON CONFLICT ("id") DO UPDATE SET "hits"=EXCLUDED."hits","name"=EXCLUDED."name"
@@ -641,7 +641,7 @@ func explainValue(v any) string {
 // INSERT unless [QueryBuilder.Replace] was called first; it cannot be mixed
 // with [QueryBuilder.Insert] / [QueryBuilder.Set] values.
 //
-//	psql.B().InsertRows([]string{"id", "name"}, []any{1, "a"}, []any{2, "b"}).Into("users")
+//	psql.B().InsertRows([]string{"id", "name"}, []any{1, "a"}, []any{2, "b"}).Table("users")
 func (q *QueryBuilder) InsertRows(columns []string, rows ...[]any) *QueryBuilder {
 	if q.Query == "" {
 		q.Query = "INSERT"
@@ -666,7 +666,7 @@ func (q *QueryBuilder) InsertRows(columns []string, rows ...[]any) *QueryBuilder
 // [QueryBuilder.InsertRows]). The columns are the sorted keys of the first
 // row; every row must have exactly the same keys.
 //
-//	psql.B().Values(map[string]any{"id": 1, "name": "a"}, map[string]any{"id": 2, "name": "b"}).Into("users")
+//	psql.B().Values(map[string]any{"id": 1, "name": "a"}, map[string]any{"id": 2, "name": "b"}).Table("users")
 //	// → INSERT INTO "users" ("id","name") VALUES (1,'a'),(2,'b')
 func (q *QueryBuilder) Values(rows ...map[string]any) *QueryBuilder {
 	if len(rows) == 0 {
