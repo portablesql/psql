@@ -273,6 +273,13 @@ func renderFindInSet(ctx *renderContext, fieldExpr, valueExpr string, not bool) 
 	}
 }
 
+// whereMapValueable is implemented by condition types that can be used as
+// the value of a WHERE map, in which case the map key is their field: fld is
+// the rendered column and not reports whether the value was wrapped in [Not].
+type whereMapValueable interface {
+	escapeWhereMapValue(ctx *renderContext, fld string, not bool) string
+}
+
 // escapeWhereSub renders a single key: value condition from a WHERE map.
 func escapeWhereSub(ctx *renderContext, key string, val any) string {
 	fld := fieldName(key).EscapeValue()
@@ -292,6 +299,10 @@ func escapeWhereSub(ctx *renderContext, key string, val any) string {
 
 	// Handle pointer wrapper types before Flatten (which dereferences pointers)
 	switch v := val.(type) {
+	case whereMapValueable:
+		// condition types that take the map key as their field (JSONContains,
+		// JSONHasKey, FullText, ...)
+		return v.escapeWhereMapValue(ctx, fld, not)
 	case *SubIn:
 		if v == nil || v.Sub == nil {
 			return whereFail(ctx, "psql: nil subquery in condition on field %q", key)

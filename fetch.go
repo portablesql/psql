@@ -12,16 +12,19 @@ import (
 // [IncludeDeleted], and [FetchLock] to create options, or combine multiple options by
 // passing them as variadic arguments.
 type FetchOptions struct {
-	Lock        bool
-	SkipLocked  bool            // append SKIP LOCKED after FOR UPDATE
-	NoWait      bool            // append NOWAIT after FOR UPDATE
-	LimitCount  int             // number of results to return if >0
-	LimitStart  int             // seek first record if >0
-	Sort        []SortValueable // fields to sort by
-	Preload     []string        // association fields to preload after fetching
-	Scopes      []Scope         // reusable query modifiers
-	WithDeleted bool            // include soft-deleted records
-	HardDelete  bool            // force hard delete even with soft delete
+	Lock           bool            // SELECT ... FOR UPDATE (same as LockMode == LockUpdate)
+	LockMode       LockMode        // row lock mode (FOR UPDATE, FOR SHARE, ...), see [QueryBuilder.SetLockMode]
+	LockOf         []string        // restrict the lock to these tables (FOR UPDATE OF "t"), see [QueryBuilder.LockOf]
+	SkipLocked     bool            // append SKIP LOCKED after the lock clause
+	NoWait         bool            // append NOWAIT after the lock clause
+	AsOfSystemTime string          // CockroachDB AS OF SYSTEM TIME expression, see [QueryBuilder.AsOfSystemTime]
+	LimitCount     int             // number of results to return if >0
+	LimitStart     int             // seek first record if >0
+	Sort           []SortValueable // fields to sort by
+	Preload        []string        // association fields to preload after fetching
+	Scopes         []Scope         // reusable query modifiers
+	WithDeleted    bool            // include soft-deleted records
+	HardDelete     bool            // force hard delete even with soft delete
 }
 
 // Sort returns a [FetchOptions] that orders results by the given fields.
@@ -53,6 +56,38 @@ var FetchLockSkipLocked = &FetchOptions{Lock: true, SkipLocked: true}
 // FetchLockNoWait is a [FetchOptions] that adds FOR UPDATE NOWAIT.
 var FetchLockNoWait = &FetchOptions{Lock: true, NoWait: true}
 
+// FetchLockShare is a [FetchOptions] that takes a shared row lock: FOR SHARE
+// on PostgreSQL, CockroachDB and MySQL 8, LOCK IN SHARE MODE on MariaDB and
+// MySQL 5.7, omitted on SQLite.
+var FetchLockShare = &FetchOptions{LockMode: LockShare}
+
+// FetchLockNoKeyUpdate is a [FetchOptions] that adds FOR NO KEY UPDATE
+// (PostgreSQL, CockroachDB; FOR UPDATE on MySQL and MariaDB).
+var FetchLockNoKeyUpdate = &FetchOptions{LockMode: LockNoKeyUpdate}
+
+// FetchLockKeyShare is a [FetchOptions] that adds FOR KEY SHARE (PostgreSQL,
+// CockroachDB; the share lock on MySQL and MariaDB).
+var FetchLockKeyShare = &FetchOptions{LockMode: LockKeyShare}
+
+// WithLock returns a [FetchOptions] taking the given row lock, optionally
+// restricted to the listed tables (FOR UPDATE OF "t"). See
+// [QueryBuilder.SetLockMode] for the rendering on each engine. Combine it
+// with [FetchLockSkipLocked] or [FetchLockNoWait] for the SKIP LOCKED / NOWAIT
+// modifiers:
+//
+//	jobs, err := psql.Fetch[Job](ctx, where, psql.WithLock(psql.LockShare), psql.FetchLockSkipLocked)
+func WithLock(mode LockMode, of ...string) *FetchOptions {
+	return &FetchOptions{LockMode: mode, LockOf: of}
+}
+
+// AsOfSystemTime returns a [FetchOptions] that reads from a historical
+// snapshot on CockroachDB (see [QueryBuilder.AsOfSystemTime]); expr is an
+// interval such as "-10s" or a timestamp. Fetching fails with an error
+// wrapping [ErrNotSupported] on other products.
+func AsOfSystemTime(expr string) *FetchOptions {
+	return &FetchOptions{AsOfSystemTime: expr}
+}
+
 // IncludeDeleted returns a [FetchOptions] that includes soft-deleted records in query results.
 func IncludeDeleted() *FetchOptions {
 	return &FetchOptions{WithDeleted: true}
@@ -66,6 +101,15 @@ func resolveFetchOpts(opts []*FetchOptions) *FetchOptions {
 		}
 		if opt.Lock {
 			res.Lock = true
+		}
+		if opt.LockMode != LockNone {
+			res.LockMode = opt.LockMode
+		}
+		if len(opt.LockOf) > 0 {
+			res.LockOf = append(res.LockOf, opt.LockOf...)
+		}
+		if opt.AsOfSystemTime != "" {
+			res.AsOfSystemTime = opt.AsOfSystemTime
 		}
 		if opt.SkipLocked {
 			res.SkipLocked = true
@@ -167,10 +211,20 @@ func (t *TableMeta[T]) selectQuery(bt *boundTable, where any, opt *FetchOptions,
 		}
 	}
 
-	if opt.Lock {
+	if opt.LockMode != LockNone {
+		req.SetLockMode(opt.LockMode)
+	} else if opt.Lock {
 		req.ForUpdate = true
+	}
+	if opt.Lock || opt.LockMode != LockNone {
 		req.SkipLocked = opt.SkipLocked
 		req.NoWait = opt.NoWait
+	}
+	if len(opt.LockOf) > 0 {
+		req.LockOf(opt.LockOf...)
+	}
+	if opt.AsOfSystemTime != "" {
+		req.AsOfSystemTime(opt.AsOfSystemTime)
 	}
 	return req.Apply(opt.Scopes...)
 }

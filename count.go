@@ -6,7 +6,8 @@ import (
 )
 
 // Count returns the number of records matching the where clause. Pass nil to count all records.
-// Optional [FetchOptions] can be passed to include soft-deleted records or apply scopes.
+// Optional [FetchOptions] can be passed to include soft-deleted records, apply
+// scopes or read as of a system time on CockroachDB.
 func Count[T any](ctx context.Context, where any, opts ...*FetchOptions) (int, error) {
 	return Table[T]().Count(ctx, where, opts...)
 }
@@ -26,6 +27,9 @@ func (t *TableMeta[T]) Count(ctx context.Context, where any, opts ...*FetchOptio
 		req = req.Where(where)
 	}
 	t.applySoftDelete(bt, req, opt)
+	if opt.AsOfSystemTime != "" {
+		req.AsOfSystemTime(opt.AsOfSystemTime)
+	}
 	req = req.Apply(opt.Scopes...)
 
 	// run query

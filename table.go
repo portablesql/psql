@@ -62,6 +62,7 @@ type TableMeta[T any] struct {
 	attrs        map[string]string
 	assocs       map[string]*assocMeta // association metadata by Go field name
 	softDelete   *StructField          // non-nil if soft delete is enabled
+	autoInc      *StructField          // non-nil if a field carries the autoinc attribute
 	views        sync.Map              // *Backend → *boundTable (names resolved by the backend's Namer)
 }
 
@@ -213,9 +214,24 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 		_, softDelete := attrs["softdelete"]
 		delete(attrs, "softdelete")
 
+		// "autoinc" marks an identity column. Like key/softdelete it must not
+		// prevent type inference, but it is put back afterwards (as
+		// autoinc=1) so dialects see it in the resolved attributes.
+		autoInc := parseAutoInc(attrs)
+		delete(attrs, "autoinc")
+
 		if len(attrs) == 0 {
 			// import based on type
 			attrs["import"] = finfo.Type.String()
+		}
+		if autoInc {
+			if !isIntegerType(finfo.Type) {
+				panic(fmt.Sprintf("psql: field %s.%s: autoinc requires an integer field, got %s", typ.Name(), finfo.Name, finfo.Type))
+			}
+			if info.autoInc != nil {
+				panic(fmt.Sprintf("psql: table %s: only one autoinc field is allowed (%s and %s)", typ.Name(), info.autoInc.Name, finfo.Name))
+			}
+			attrs["autoinc"] = "1"
 		}
 
 		var setter func(reflect.Value, sql.RawBytes) error
@@ -244,8 +260,12 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 			Rattrs:      make(map[Engine]map[string]string),
 			explicitCol: explicitCol,
 			json:        isJSONFormat(attrs),
+			autoinc:     autoInc,
 		}
 		names = append(names, QuoteName(col))
+		if autoInc {
+			info.autoInc = fld
+		}
 
 		// TODO handle other kind of nullables, such as sql.NullString etc
 		if finfo.Type.Kind() == reflect.Ptr {
@@ -279,6 +299,44 @@ func buildTableMeta[T any](typ reflect.Type) *TableMeta[T] {
 
 	info.fldStr = strings.Join(names, ",")
 	return info
+}
+
+// parseAutoInc reports whether attrs declare an identity column: a bare
+// "autoinc" or autoinc=1/true. autoinc=0/false is accepted and means no.
+func parseAutoInc(attrs map[string]string) bool {
+	v, ok := attrs["autoinc"]
+	if !ok {
+		return false
+	}
+	switch v {
+	case "0", "false", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+// isIntegerType reports whether typ (or the type it points to) is a Go
+// integer kind.
+func isIntegerType(typ reflect.Type) bool {
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
+}
+
+// AutoIncField returns the field declared with the autoinc attribute, or nil
+// when the table has none. See [StructField.IsAutoInc].
+func (t *TableMeta[T]) AutoIncField() *StructField {
+	if t == nil {
+		return nil
+	}
+	return t.autoInc
 }
 
 // Name returns the table name as declared: the value of the psql.Name tag, or

@@ -131,6 +131,28 @@ func IsDuplicate(err error) bool {
 	return false
 }
 
+// IsRetryable reports whether err is a transient transaction failure that
+// should be retried from the beginning of the transaction: a serialization
+// failure (SQLSTATE 40001 on PostgreSQL, "restart transaction" / 40001 on
+// CockroachDB) or a deadlock / lock wait timeout (MySQL errors 1213 and
+// 1205). Like [IsDuplicate] it consults every registered dialect that
+// implements [RetryableChecker]; an engine whose dialect does not implement
+// the interface never reports retryable errors. [Tx] and [TxWithOptions]
+// use the dialect of the context's backend to decide whether to retry.
+func IsRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, d := range dialects {
+		if rc, ok := d.(RetryableChecker); ok {
+			if rc.IsRetryable(err) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Sentinel errors returned by psql operations.
 var (
 	// ErrNotReady is returned when an operation is attempted on a nil table or
@@ -152,4 +174,10 @@ var (
 	// ErrUnknownField is returned when a Go field or column name given to
 	// [FetchMapped] or [FetchGrouped] does not exist on the table.
 	ErrUnknownField = errors.New("unknown field or column")
+	// ErrTxRetriesExhausted is returned by [Tx] and [TxWithOptions] when the
+	// last attempt failed with a retryable error (see [IsRetryable]) and no
+	// retry is left. The returned error wraps both this sentinel and the last
+	// error, so errors.Is(err, psql.ErrTxRetriesExhausted) and errors.As on
+	// the driver error both work.
+	ErrTxRetriesExhausted = errors.New("transaction retries exhausted")
 )

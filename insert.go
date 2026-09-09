@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"reflect"
+	"strings"
 )
 
 // Insert is a short way to insert objects into database
@@ -26,13 +27,19 @@ func Insert[T any](ctx context.Context, target ...*T) error {
 }
 
 // Insert inserts the given objects, one statement each, using a single
-// prepared statement. Fires [BeforeSaveHook], [BeforeInsertHook],
-// [AfterInsertHook] and [AfterSaveHook] if implemented.
+// prepared statement per statement shape. Fires [BeforeSaveHook],
+// [BeforeInsertHook], [AfterInsertHook] and [AfterSaveHook] if implemented.
 //
 // On engines supporting RETURNING (PostgreSQL) the objects are refreshed with
-// the stored row. Elsewhere, when the table's primary key is a single integer
-// field that is still zero, it is populated from the driver's LastInsertId
-// (auto-increment / rowid). Query failures are returned as an [*Error].
+// the stored row. Elsewhere, when the table has an autoinc column (see
+// [StructField.IsAutoInc]) or its primary key is a single integer field, and
+// that field is still zero, it is populated from the driver's LastInsertId
+// (auto-increment / rowid).
+//
+// An autoinc column whose field is zero (or a nil pointer) is omitted from
+// the INSERT so the database generates it; objects carrying a value keep it.
+// A call mixing both kinds of objects prepares at most two statements. Query
+// failures are returned as an [*Error].
 func (t *TableMeta[T]) Insert(ctx context.Context, targets ...*T) error {
 	return t.insertRows(ctx, insertPlain, targets)
 }
@@ -75,6 +82,88 @@ func (m insertMode) String() string {
 
 var valuerType = reflect.TypeFor[driver.Valuer]()
 
+// insertShape is the column set of an INSERT statement: every column of the
+// table, or every column but the autoinc one when the database generates it.
+type insertShape struct {
+	fields []*StructField
+	fldStr string
+	// omitAutoInc is true when the autoinc column is left out.
+	omitAutoInc bool
+}
+
+// insertShapes returns the shapes available for bt: index 0 has every
+// column, index 1 (present only when the table has an autoinc column) leaves
+// the autoinc column out.
+func insertShapes(bt *boundTable) []insertShape {
+	shapes := []insertShape{{fields: bt.fields, fldStr: bt.fldStr}}
+	if bt.autoInc == nil {
+		return shapes
+	}
+	fields := make([]*StructField, 0, len(bt.fields)-1)
+	names := make([]string, 0, len(bt.fields)-1)
+	for _, f := range bt.fields {
+		if f == bt.autoInc {
+			continue
+		}
+		fields = append(fields, f)
+		names = append(names, QuoteName(f.Column))
+	}
+	shapes = append(shapes, insertShape{fields: fields, fldStr: strings.Join(names, ","), omitAutoInc: true})
+	return shapes
+}
+
+// omitAutoInc reports whether the autoinc column of bt must be left out of
+// the statement inserting val: when the field is zero or a nil pointer.
+func omitAutoInc(bt *boundTable, val reflect.Value) bool {
+	if bt.autoInc == nil {
+		return false
+	}
+	return val.Field(bt.autoInc.Index).IsZero()
+}
+
+// insertSQL renders the single-row statement for shape in the given mode,
+// with RETURNING when useReturning is set (the whole row is returned so the
+// object can be refreshed).
+func (t *TableMeta[T]) insertSQL(engine Engine, bt *boundTable, mode insertMode, shape insertShape, useReturning bool) (string, error) {
+	tableName := bt.name
+	ph := engine.Placeholders(len(shape.fields), 1)
+	d := engine.dialect()
+	ur, hasUpsert := d.(UpsertRenderer)
+
+	var req string
+	switch mode {
+	case insertIgnore:
+		if hasUpsert {
+			req = ur.InsertIgnoreSQL(tableName, shape.fldStr, ph)
+		} else {
+			// Generic fallback: MySQL-like INSERT IGNORE
+			req = "INSERT IGNORE INTO " + QuoteName(tableName) + " (" + shape.fldStr + ") VALUES (" + ph + ")"
+		}
+	case insertReplace:
+		if hasUpsert {
+			req = ur.ReplaceSQL(tableName, shape.fldStr, ph, bt.mainKey, shape.fields)
+		} else {
+			// Generic fallback: MySQL-like REPLACE INTO
+			if bt.mainKey == nil {
+				return "", errors.New("cannot use Replace without a primary key")
+			}
+			req = "REPLACE INTO " + QuoteName(tableName) + " (" + shape.fldStr + ") VALUES (" + ph + ")"
+		}
+	default:
+		req = "INSERT INTO " + QuoteName(tableName) + " (" + shape.fldStr + ") VALUES (" + ph + ")"
+	}
+	if useReturning {
+		req += " RETURNING " + bt.fldStr
+	}
+	return req, nil
+}
+
+// preparedShape is a statement prepared for one insert shape.
+type preparedShape struct {
+	req  string
+	stmt *sql.Stmt
+}
+
 // insertRows is the shared implementation of Insert, InsertIgnore and Replace.
 func (t *TableMeta[T]) insertRows(ctx context.Context, mode insertMode, targets []*T) error {
 	if t == nil {
@@ -86,50 +175,41 @@ func (t *TableMeta[T]) insertRows(ctx context.Context, mode insertMode, targets 
 	engine := be.Engine()
 	bt := t.bind(be)
 	tableName := bt.name
-
-	ph := engine.Placeholders(len(bt.fields), 1)
 	d := engine.dialect()
-	ur, hasUpsert := d.(UpsertRenderer)
-
-	var req string
-	switch mode {
-	case insertIgnore:
-		if hasUpsert {
-			req = ur.InsertIgnoreSQL(tableName, bt.fldStr, ph)
-		} else {
-			// Generic fallback: MySQL-like INSERT IGNORE
-			req = "INSERT IGNORE INTO " + QuoteName(tableName) + " (" + bt.fldStr + ") VALUES (" + ph + ")"
-		}
-	case insertReplace:
-		if hasUpsert {
-			req = ur.ReplaceSQL(tableName, bt.fldStr, ph, bt.mainKey, bt.fields)
-		} else {
-			// Generic fallback: MySQL-like REPLACE INTO
-			if bt.mainKey == nil {
-				return errors.New("cannot use Replace without a primary key")
-			}
-			req = "REPLACE INTO " + QuoteName(tableName) + " (" + bt.fldStr + ") VALUES (" + ph + ")"
-		}
-	default:
-		req = "INSERT INTO " + QuoteName(tableName) + " (" + bt.fldStr + ") VALUES (" + ph + ")"
-	}
 
 	useReturning := false
 	if rr, ok := d.(ReturningRenderer); ok {
 		useReturning = rr.SupportsReturning()
 	}
-	if useReturning {
-		req += " RETURNING " + bt.fldStr
-	}
 
 	event := "psql:" + mode.String()
 
-	stmt, err := doPrepareContext(ctx, req)
-	if err != nil {
-		logQueryError(ctx, event+":prep_fail", tableName, req, err)
-		return &Error{Query: req, Err: err}
+	// statements are prepared lazily, once per shape actually used
+	shapes := insertShapes(bt)
+	prepared := make([]*preparedShape, len(shapes))
+	defer func() {
+		for _, p := range prepared {
+			if p != nil {
+				p.stmt.Close()
+			}
+		}
+	}()
+	prepare := func(idx int) (*preparedShape, error) {
+		if p := prepared[idx]; p != nil {
+			return p, nil
+		}
+		req, err := t.insertSQL(engine, bt, mode, shapes[idx], useReturning)
+		if err != nil {
+			return nil, err
+		}
+		stmt, err := doPrepareContext(ctx, req)
+		if err != nil {
+			logQueryError(ctx, event+":prep_fail", tableName, req, err)
+			return nil, &Error{Query: req, Err: err}
+		}
+		prepared[idx] = &preparedShape{req: req, stmt: stmt}
+		return prepared[idx], nil
 	}
-	defer stmt.Close()
 
 	var autoKey *StructField
 	if !useReturning {
@@ -151,25 +231,34 @@ func (t *TableMeta[T]) insertRows(ctx context.Context, mode insertMode, targets 
 		}
 
 		val := reflect.ValueOf(target).Elem()
-		params := make([]any, len(bt.fields))
-		for n, f := range bt.fields {
+		idx := 0
+		if omitAutoInc(bt, val) {
+			idx = 1
+		}
+		p, err := prepare(idx)
+		if err != nil {
+			return err
+		}
+		shape := shapes[idx]
+		params := make([]any, len(shape.fields))
+		for n, f := range shape.fields {
 			params[n] = exportField(engine, val.Field(f.Index), f)
 		}
 
 		if useReturning {
-			rows, err := stmt.QueryContext(ctx, params...)
+			rows, err := p.stmt.QueryContext(ctx, params...)
 			if err != nil {
-				logQueryError(ctx, event+":run_fail", tableName, req, err)
-				return &Error{Query: req, Err: err}
+				logQueryError(ctx, event+":run_fail", tableName, p.req, err)
+				return &Error{Query: p.req, Err: err}
 			}
 			if err := t.scanReturning(ctx, rows, target); err != nil {
 				return err
 			}
 		} else {
-			res, err := stmt.ExecContext(ctx, params...)
+			res, err := p.stmt.ExecContext(ctx, params...)
 			if err != nil {
-				logQueryError(ctx, event+":run_fail", tableName, req, err)
-				return &Error{Query: req, Err: err}
+				logQueryError(ctx, event+":run_fail", tableName, p.req, err)
+				return &Error{Query: p.req, Err: err}
 			}
 			if autoKey != nil {
 				t.applyLastInsertId(res, autoKey, target)
@@ -217,9 +306,13 @@ func exportField(engine Engine, fval reflect.Value, f *StructField) any {
 	return engine.export(fval.Interface(), f)
 }
 
-// autoIncrementField returns the primary key field if it is a single integer
-// column that can be populated from LastInsertId, or nil.
+// autoIncrementField returns the field populated from LastInsertId: the
+// autoinc column when the table declares one, otherwise the primary key if
+// it is a single integer column, or nil.
 func (t *TableMeta[T]) autoIncrementField(bt *boundTable) *StructField {
+	if bt.autoInc != nil {
+		return bt.autoInc
+	}
 	if bt.mainKey == nil || bt.mainKey.Typ != KeyPrimary || len(bt.mainKey.Fields) != 1 {
 		return nil
 	}

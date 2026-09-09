@@ -52,9 +52,23 @@ type QueryBuilder struct {
 	renderData  []any             // JOIN clauses
 
 	// conflict/upsert
-	ConflictColumns []string // ON CONFLICT (columns)
-	ConflictUpdate  []any    // DO UPDATE SET fields (map[string]any entries)
-	ConflictNothing bool     // DO NOTHING / INSERT IGNORE
+	ConflictColumns    []string // ON CONFLICT (columns)
+	ConflictConstraint string   // ON CONFLICT ON CONSTRAINT name (see [QueryBuilder.OnConflictConstraint])
+	ConflictUpdate     []any    // DO UPDATE SET fields (map[string]any entries)
+	ConflictWhere      WhereAND // DO UPDATE SET ... WHERE conditions (see [QueryBuilder.DoUpdateWhere])
+	ConflictNothing    bool     // DO NOTHING / INSERT IGNORE
+
+	// multi-row INSERT (see [QueryBuilder.InsertRows] and [QueryBuilder.Values])
+	InsertColumns []string // column list of the VALUES rows
+	InsertValues  [][]any  // one entry per row, in InsertColumns order
+
+	// advanced clauses
+	ReturningFields  []any        // RETURNING expressions (see [QueryBuilder.Returning])
+	CTEs             []*cteClause // WITH clauses (see [QueryBuilder.With])
+	DistinctOnFields []any        // DISTINCT ON expressions (see [QueryBuilder.DistinctOn])
+	Lock             LockMode     // row lock mode (see [QueryBuilder.SetLockMode]); ForUpdate means LockUpdate
+	LockTables       []string     // FOR UPDATE OF tables (see [QueryBuilder.LockOf])
+	AsOf             string       // AS OF SYSTEM TIME expression (see [QueryBuilder.AsOfSystemTime])
 
 	// flags
 	Distinct      bool // SELECT DISTINCT
@@ -256,39 +270,56 @@ func (q *QueryBuilder) OnConflict(columns ...string) *QueryBuilder {
 }
 
 // DoUpdate specifies the fields to update on conflict. Accepts map[string]any
-// entries, similar to [QueryBuilder.Set]. On PostgreSQL and SQLite the
-// conflict columns must be given with [QueryBuilder.OnConflict], otherwise
-// rendering fails; MySQL renders ON DUPLICATE KEY UPDATE.
+// entries, similar to [QueryBuilder.Set]. On PostgreSQL, CockroachDB and
+// SQLite the conflict target must be given with [QueryBuilder.OnConflict] or
+// [QueryBuilder.OnConflictConstraint], otherwise rendering fails; MySQL and
+// MariaDB render ON DUPLICATE KEY UPDATE. Use [Excluded] values to refer to
+// the row that would have been inserted; this renders correctly on every
+// engine and is the recommended way to write a portable upsert:
+//
+//	psql.B().Insert(map[string]any{"id": 1, "hits": 1}).Into("t").
+//	    OnConflict("id").DoUpdate(map[string]any{"hits": psql.Excluded("hits")})
+//
+// [QueryBuilder.DoUpdateWhere] restricts the update to matching rows.
 func (q *QueryBuilder) DoUpdate(fields ...any) *QueryBuilder {
 	q.ConflictUpdate = append(q.ConflictUpdate, fields...)
 	return q
 }
 
-// DoNothing sets the ON CONFLICT action to DO NOTHING (PostgreSQL/SQLite)
-// or INSERT IGNORE (MySQL).
+// DoNothing sets the ON CONFLICT action to DO NOTHING (PostgreSQL and
+// CockroachDB, with the [QueryBuilder.OnConflict] target when one is given),
+// INSERT OR IGNORE (SQLite) or INSERT IGNORE (MySQL).
 func (q *QueryBuilder) DoNothing() *QueryBuilder {
 	q.ConflictNothing = true
 	return q
 }
 
-// SetForUpdate adds FOR UPDATE locking to the query.
+// SetForUpdate adds FOR UPDATE locking to the query; it is equivalent to
+// SetLockMode([LockUpdate]). See [QueryBuilder.SetLockMode] for the
+// rendering on each engine.
 func (q *QueryBuilder) SetForUpdate() *QueryBuilder {
 	q.ForUpdate = true
 	return q
 }
 
-// SetSkipLocked adds SKIP LOCKED after FOR UPDATE. Rows locked by other
-// transactions are skipped instead of blocking.
+// SetSkipLocked adds SKIP LOCKED after the lock clause (FOR UPDATE unless
+// another mode was chosen with [QueryBuilder.SetLockMode]). Rows locked by
+// other transactions are skipped instead of blocking.
 func (q *QueryBuilder) SetSkipLocked() *QueryBuilder {
-	q.ForUpdate = true
+	if q.Lock == LockNone {
+		q.ForUpdate = true
+	}
 	q.SkipLocked = true
 	return q
 }
 
-// SetNoWait adds NOWAIT after FOR UPDATE. The query fails immediately if
-// any selected row is locked by another transaction.
+// SetNoWait adds NOWAIT after the lock clause (FOR UPDATE unless another
+// mode was chosen with [QueryBuilder.SetLockMode]). The query fails
+// immediately if any selected row is locked by another transaction.
 func (q *QueryBuilder) SetNoWait() *QueryBuilder {
-	q.ForUpdate = true
+	if q.Lock == LockNone {
+		q.ForUpdate = true
+	}
 	q.NoWait = true
 	return q
 }
@@ -462,14 +493,30 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 		return q.err
 	}
 
-	// Generate the actual SQL query
-	ctx.req = []string{q.Query}
+	// CTEs are rendered first so that their arguments are numbered before
+	// those of the main query; the WITH clause prefixes every statement,
+	// except that MySQL only accepts it ahead of the SELECT part of an
+	// INSERT ... SELECT.
+	var prefix []string
+	with := q.renderWith(ctx)
+	if ctx.err != nil {
+		return ctx.err
+	}
+	mysqlInsertSelect := q.Query == "INSERT_SELECT" && ctx.e == EngineMySQL
+	if with != "" && !mysqlInsertSelect {
+		prefix = []string{with}
+	}
+	// start resets the query to the WITH prefix followed by words.
+	start := func(words ...string) {
+		ctx.req = append(append([]string(nil), prefix...), words...)
+	}
+	start(q.Query)
 	var err error
 
 	switch q.Query {
 	case "SELECT":
-		if q.Distinct {
-			ctx.append("DISTINCT")
+		if err = q.renderDistinct(ctx); err != nil {
+			return err
 		}
 		if q.CalcFoundRows {
 			ctx.append("SQL_CALC_FOUND_ROWS")
@@ -483,6 +530,9 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 		if err != nil {
 			return err
 		}
+		if err = q.renderAsOf(ctx); err != nil {
+			return err
+		}
 	case "DELETE":
 		ctx.append("FROM")
 		err = q.renderTables(ctx)
@@ -493,14 +543,27 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 		if q.UpdateIgnore {
 			ctx.append("IGNORE")
 		}
-		fallthrough
-	case "REPLACE":
 		err = q.renderTables(ctx)
 		if err != nil {
 			return err
 		}
 		ctx.append("SET")
 		ctx.append(renderAssignments(ctx, q.FieldsSet))
+	case "REPLACE":
+		if len(q.InsertValues) > 0 {
+			// column-list form, valid on MySQL, MariaDB and SQLite
+			ctx.append("INTO")
+		}
+		err = q.renderTables(ctx)
+		if err != nil {
+			return err
+		}
+		if len(q.InsertValues) > 0 {
+			ctx.append(q.renderInsertRows(ctx))
+		} else {
+			ctx.append("SET")
+			ctx.append(renderAssignments(ctx, q.FieldsSet))
+		}
 	case "INSERT":
 		switch ctx.e {
 		case EnginePostgreSQL:
@@ -510,35 +573,30 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			if err != nil {
 				return err
 			}
-			ctx.append(q.renderInsertColsVals(ctx))
+			ctx.append(q.renderInsertBody(ctx))
 			// ON CONFLICT clause
-			if len(q.ConflictUpdate) > 0 {
-				err = q.renderOnConflictUpdate(ctx)
-				if err != nil {
-					return err
-				}
-			} else if q.InsertIgnore || q.ConflictNothing {
-				ctx.append("ON CONFLICT DO NOTHING")
+			err = q.renderOnConflict(ctx, q.InsertIgnore || q.ConflictNothing)
+			if err != nil {
+				return err
 			}
 		case EngineSQLite:
 			// SQLite: use (cols) VALUES (vals) format
 			if q.InsertIgnore || q.ConflictNothing {
-				ctx.req = []string{"INSERT", "OR", "IGNORE"}
+				start("INSERT", "OR", "IGNORE")
 			}
 			ctx.append("INTO")
 			err = q.renderTables(ctx)
 			if err != nil {
 				return err
 			}
-			ctx.append(q.renderInsertColsVals(ctx))
-			if len(q.ConflictUpdate) > 0 {
-				err = q.renderOnConflictUpdate(ctx)
-				if err != nil {
-					return err
-				}
+			ctx.append(q.renderInsertBody(ctx))
+			err = q.renderOnConflict(ctx, false)
+			if err != nil {
+				return err
 			}
 		default:
-			// MySQL / Unknown: use SET syntax (MySQL-native)
+			// MySQL / Unknown: use SET syntax (MySQL-native) for a single
+			// row, the column-list form for InsertRows
 			if q.InsertIgnore || q.ConflictNothing {
 				ctx.append("IGNORE")
 			}
@@ -547,26 +605,43 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 			if err != nil {
 				return err
 			}
-			ctx.append("SET")
-			ctx.append(renderAssignments(ctx, q.FieldsSet))
-			if len(q.ConflictUpdate) > 0 {
-				ctx.append("ON DUPLICATE KEY UPDATE")
-				ctx.append(renderAssignments(ctx, q.ConflictUpdate))
+			if len(q.InsertValues) > 0 {
+				ctx.append(q.renderInsertRows(ctx))
+			} else {
+				ctx.append("SET")
+				ctx.append(renderAssignments(ctx, q.FieldsSet))
+			}
+			err = q.renderOnDuplicateKey(ctx)
+			if err != nil {
+				return err
 			}
 		}
 	case "INSERT_SELECT":
 		if len(q.Tables) < 2 {
 			return fmt.Errorf("INSERT SELECT requires at least two tables")
 		}
-		ctx.req = []string{"INSERT"}
-		if q.InsertIgnore {
-			ctx.append("IGNORE")
+		start("INSERT")
+		ignore := q.InsertIgnore || q.ConflictNothing
+		switch ctx.e {
+		case EngineSQLite:
+			if ignore {
+				ctx.append("OR IGNORE")
+			}
+		case EnginePostgreSQL:
+			// rendered as ON CONFLICT DO NOTHING after the SELECT
+		default:
+			if ignore {
+				ctx.append("IGNORE")
+			}
 		}
 		table := q.Tables[0]
 		ctx.append("INTO", escapeTableWithCtx(ctx, table))
+		if mysqlInsertSelect && with != "" {
+			ctx.append(with)
+		}
 		ctx.append("SELECT")
-		if q.Distinct {
-			ctx.append("DISTINCT")
+		if err = q.renderDistinct(ctx); err != nil {
+			return err
 		}
 		err = q.renderFields(ctx)
 		if err != nil {
@@ -612,33 +687,37 @@ func (q *QueryBuilder) render(ctx *renderContext) error {
 		// LimitData is [offset, count]; LIMIT count OFFSET offset works on every engine
 		ctx.append("LIMIT", strconv.Itoa(q.LimitData[1]), "OFFSET", strconv.Itoa(q.LimitData[0]))
 	}
-	if q.ForUpdate && ctx.e != EngineSQLite {
-		// SQLite uses file/WAL-level locking, so FOR UPDATE is silently
-		// omitted — users shouldn't need to worry about the engine.
-		ctx.append("FOR UPDATE")
-		if q.SkipLocked {
-			ctx.append("SKIP LOCKED")
-		} else if q.NoWait {
-			ctx.append("NOWAIT")
+	if err = q.renderLock(ctx); err != nil {
+		return err
+	}
+	if q.Query == "INSERT_SELECT" {
+		// conflict clause of INSERT ... SELECT comes after the SELECT
+		switch ctx.e {
+		case EnginePostgreSQL:
+			err = q.renderOnConflict(ctx, q.InsertIgnore || q.ConflictNothing)
+		case EngineSQLite:
+			err = q.renderOnConflict(ctx, false)
+		default:
+			err = q.renderOnDuplicateKey(ctx)
 		}
+		if err != nil {
+			return err
+		}
+	}
+	if err = q.renderReturning(ctx); err != nil {
+		return err
 	}
 
 	return ctx.err
 }
 
-// renderOnConflictUpdate renders the ON CONFLICT (cols) DO UPDATE SET clause
-// used by PostgreSQL and SQLite. The conflict columns are mandatory.
-func (q *QueryBuilder) renderOnConflictUpdate(ctx *renderContext) error {
-	if len(q.ConflictColumns) == 0 {
-		return fmt.Errorf("psql: DoUpdate requires OnConflict columns on %s", ctx.e)
+// renderInsertBody renders the values part of an INSERT in column-list form:
+// the InsertRows/Values rows when given, the single Insert/Set row otherwise.
+func (q *QueryBuilder) renderInsertBody(ctx *renderContext) string {
+	if len(q.InsertValues) > 0 {
+		return q.renderInsertRows(ctx)
 	}
-	conflictCols := make([]string, len(q.ConflictColumns))
-	for i, c := range q.ConflictColumns {
-		conflictCols[i] = QuoteName(c)
-	}
-	ctx.append("ON CONFLICT (" + strings.Join(conflictCols, ",") + ") DO UPDATE SET")
-	ctx.append(renderAssignments(ctx, q.ConflictUpdate))
-	return nil
+	return q.renderInsertColsVals(ctx)
 }
 
 func (q *QueryBuilder) renderFields(ctx *renderContext) error {

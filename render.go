@@ -12,6 +12,7 @@ import (
 type renderContext struct {
 	e       Engine
 	v       Variant // detected product (VariantUnknown when rendering without a backend)
+	sv      string  // server version reported by the backend ("" when unknown)
 	d       Dialect
 	req     []string
 	args    []any
@@ -29,6 +30,7 @@ func newRenderContext(e Engine, useArgs bool) *renderContext {
 func newBackendRenderContext(be *Backend, useArgs bool) *renderContext {
 	rc := newRenderContext(be.Engine(), useArgs)
 	rc.v = be.Variant()
+	rc.sv = be.ServerVersion()
 	return rc
 }
 

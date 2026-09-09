@@ -25,6 +25,7 @@ type boundTable struct {
 	keys       []*StructKey
 	mainKey    *StructKey
 	softDelete *StructField
+	autoInc    *StructField // identity column (resolved), or nil
 	attrs      map[string]string
 }
 
@@ -125,6 +126,7 @@ func (t *TableMeta[T]) buildView(be *Backend, namer Namer) *boundTable {
 		bt.keys = t.keys
 		bt.mainKey = t.mainKey
 		bt.softDelete = t.softDelete
+		bt.autoInc = t.autoInc
 		return bt
 	}
 
@@ -136,6 +138,9 @@ func (t *TableMeta[T]) buildView(be *Backend, namer Namer) *boundTable {
 		names[i] = QuoteName(f.Column)
 		if t.softDelete != nil && f.Index == t.softDelete.Index {
 			bt.softDelete = f
+		}
+		if t.autoInc != nil && f.Index == t.autoInc.Index {
+			bt.autoInc = f
 		}
 	}
 	bt.fldStr = strings.Join(names, ",")

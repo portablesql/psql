@@ -3,6 +3,9 @@ package psql
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"math/rand/v2"
+	"time"
 )
 
 type ctxData int
@@ -49,8 +52,78 @@ func ContextTx(ctx context.Context, tx *TxProxy) context.Context {
 	return &ctxValueObj{ctx, tx}
 }
 
+// DefaultTxRetries is the number of times [Tx] (and [TxWithOptions] with a
+// zero MaxRetries) re-runs a transaction that failed with a retryable error
+// (see [IsRetryable]), in addition to the first attempt.
+var DefaultTxRetries = 3
+
+// TxOptions configures [TxWithOptions].
+type TxOptions struct {
+	// Isolation and ReadOnly are passed to database/sql when the transaction
+	// is started (they map to sql.TxOptions). They are ignored for nested
+	// transactions, which run as savepoints of the enclosing one.
+	Isolation sql.IsolationLevel
+	ReadOnly  bool
+	// MaxRetries is the number of times the callback is re-run after a
+	// retryable failure. 0 means [DefaultTxRetries]; a negative value
+	// disables retries.
+	MaxRetries int
+	// Backoff returns how long to wait before retry attempt (1 for the first
+	// retry). nil uses an exponential backoff with jitter starting around
+	// 10ms and capped at one second.
+	Backoff func(attempt int) time.Duration
+}
+
+// sqlOptions converts o to the database/sql options given to BeginTx.
+func (o *TxOptions) sqlOptions() *sql.TxOptions {
+	if o == nil || (o.Isolation == sql.LevelDefault && !o.ReadOnly) {
+		return nil
+	}
+	return &sql.TxOptions{Isolation: o.Isolation, ReadOnly: o.ReadOnly}
+}
+
+// maxRetries returns the effective retry count.
+func (o *TxOptions) maxRetries() int {
+	if o == nil || o.MaxRetries == 0 {
+		return DefaultTxRetries
+	}
+	if o.MaxRetries < 0 {
+		return 0
+	}
+	return o.MaxRetries
+}
+
+// backoff returns the delay before the given retry attempt.
+func (o *TxOptions) backoff(attempt int) time.Duration {
+	if o != nil && o.Backoff != nil {
+		return o.Backoff(attempt)
+	}
+	return defaultTxBackoff(attempt)
+}
+
+// defaultTxBackoff doubles a 10ms base for each attempt, with ±50% jitter,
+// and never waits more than a second: roughly 10ms, 20ms, 40ms...
+func defaultTxBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	base := 10 * time.Millisecond
+	for i := 1; i < attempt && base < time.Second; i++ {
+		base *= 2
+	}
+	if base > time.Second {
+		base = time.Second
+	}
+	// jitter in [0.5, 1.5) × base
+	jitter := time.Duration(rand.Int64N(int64(base))) - base/2
+	return base + jitter
+}
+
 // Tx runs cb inside a SQL transaction. If cb returns nil the transaction is
-// committed; otherwise it is rolled back and the error is returned.
+// committed; otherwise it is rolled back and the error is returned. It is
+// [TxWithOptions] with nil options: default isolation, and up to
+// [DefaultTxRetries] retries on retryable failures, so cb must be safe to
+// re-run (see TxWithOptions).
 //
 // The context passed to cb carries the transaction, so all psql operations
 // using it execute within that transaction. To run a query outside the
@@ -68,7 +141,62 @@ func ContextTx(ctx context.Context, tx *TxProxy) context.Context {
 //	    return nil
 //	})
 func Tx(ctx context.Context, cb func(ctx context.Context) error) error {
-	tx, err := BeginTx(ctx, nil)
+	return TxWithOptions(ctx, nil, cb)
+}
+
+// TxWithOptions runs cb inside a SQL transaction started with the given
+// options (nil for defaults), committing when cb returns nil and rolling back
+// otherwise.
+//
+// When the transaction is top-level (ctx does not already carry one) and cb
+// or the commit fails with an error the backend's dialect reports as
+// retryable (serialization failure, deadlock; see [IsRetryable]), the
+// transaction is rolled back and, after a backoff, cb IS RUN AGAIN with a
+// fresh transaction, up to opts.MaxRetries times. The callback must
+// therefore be idempotent with respect to anything outside the database:
+// do not send emails, publish messages, mutate in-memory state or capture
+// results in outer variables without resetting them at the start of the
+// callback; everything it does inside the transaction is discarded by the
+// rollback, everything else is repeated. When retries are exhausted the
+// last error is returned wrapped with [ErrTxRetriesExhausted]. If ctx is
+// cancelled while waiting for a retry, the wait stops and the cancellation
+// error is returned.
+//
+// A nested call (ctx already carries a transaction) runs cb once as a
+// savepoint and returns its error unchanged: retrying part of a transaction
+// is meaningless, and the error propagates so that the outer, top-level
+// transaction can retry as a whole.
+func TxWithOptions(ctx context.Context, opts *TxOptions, cb func(ctx context.Context) error) error {
+	if _, nested := EscapeTx(ctx); nested {
+		return runTxOnce(ctx, opts.sqlOptions(), cb)
+	}
+
+	retries := opts.maxRetries()
+	var rc RetryableChecker
+	if retries > 0 {
+		rc, _ = GetBackend(ctx).Engine().dialect().(RetryableChecker)
+	}
+
+	for attempt := 0; ; attempt++ {
+		err := runTxOnce(ctx, opts.sqlOptions(), cb)
+		if err == nil || rc == nil || !rc.IsRetryable(err) {
+			return err
+		}
+		if attempt >= retries {
+			return fmt.Errorf("%w after %d attempt(s): %w", ErrTxRetriesExhausted, attempt+1, err)
+		}
+		debugLog(ctx, "retrying transaction (attempt %d of %d) after: %v", attempt+2, retries+1, err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("transaction retry aborted: %w (last error: %w)", ctx.Err(), err)
+		case <-time.After(opts.backoff(attempt + 1)):
+		}
+	}
+}
+
+// runTxOnce performs a single attempt: begin, cb, commit or rollback.
+func runTxOnce(ctx context.Context, opts *sql.TxOptions, cb func(ctx context.Context) error) error {
+	tx, err := BeginTx(ctx, opts)
 	if err != nil {
 		return err
 	}

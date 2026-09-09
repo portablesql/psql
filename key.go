@@ -11,9 +11,9 @@ var keyType = reflect.TypeFor[Key]()
 
 // Key declares a key or index on the table when embedded as a field of a
 // struct. The sql tag gives the key name (defaults to the field name), its
-// type (PRIMARY, UNIQUE, INDEX, FULLTEXT, SPATIAL, VECTOR; INDEX when omitted)
-// and the columns it spans, so composite keys are expressed with a
-// comma-separated, quoted fields list:
+// type (PRIMARY, UNIQUE, INDEX, FULLTEXT, SPATIAL, VECTOR, GIN, GIST; INDEX
+// when omitted) and the columns it spans, so composite keys are expressed
+// with a comma-separated, quoted fields list:
 //
 //	type Membership struct {
 //		UserID  uint64
@@ -21,6 +21,19 @@ var keyType = reflect.TypeFor[Key]()
 //		Role    string   `sql:",type=VARCHAR,size=32"`
 //		PK      psql.Key `sql:"PRIMARY,type=PRIMARY,fields='UserID,GroupID'"`
 //		RoleIdx psql.Key `sql:",fields='Role'"`
+//	}
+//
+// GIN and GIST keys are PostgreSQL index methods (jsonb containment, full-text
+// search, ranges); other engines skip them. An expression attribute replaces
+// the column list with an indexed expression, in which {Column} refers to a
+// column. As the tag parser strips quote characters, quote the expression
+// with double quotes (written \" inside the Go tag):
+//
+//	type Post struct {
+//		Data    string   `sql:",type=JSON"`
+//		Title   string   `sql:",type=VARCHAR,size=255"`
+//		DataIdx psql.Key `sql:",type=GIN,fields='Data'"`
+//		TextIdx psql.Key `sql:",type=GIN,expression=\"to_tsvector('simple', {Title})\""`
 //	}
 //
 // Single-column keys can also be declared on the column itself with the key
@@ -49,6 +62,8 @@ const (
 	KeyFulltext = 4 // FULLTEXT index
 	KeySpatial  = 5 // SPATIAL index
 	KeyVector   = 6 // vector similarity index
+	KeyGIN      = 7 // PostgreSQL GIN index (jsonb, arrays, tsvector)
+	KeyGIST     = 8 // PostgreSQL GiST index (ranges, geometry, tsvector)
 )
 
 // StructKey holds metadata for a table key/index, including its type, column
@@ -78,6 +93,10 @@ func (k *StructKey) loadAttrs(attrs map[string]string) {
 			k.Typ = KeySpatial
 		case "VECTOR":
 			k.Typ = KeyVector
+		case "GIN":
+			k.Typ = KeyGIN
+		case "GIST":
+			k.Typ = KeyGIST
 		default:
 			slog.Warn(fmt.Sprintf("[psql] Unsupported index key type %s assumed as INDEX", t), "event", "psql:key:badkey", "psql.index", k.Name)
 		}
@@ -85,7 +104,36 @@ func (k *StructKey) loadAttrs(attrs map[string]string) {
 		k.Typ = KeyPrimary
 	}
 	k.Attrs = attrs
-	k.Fields = strings.Split(attrs["fields"], ",")
+	if fields, ok := attrs["fields"]; ok || attrs["expression"] == "" {
+		k.Fields = strings.Split(fields, ",")
+	}
+}
+
+// Expression returns the indexed expression declared with the expression
+// attribute, with {Column} references replaced by quoted column names, or ""
+// when the key indexes a column list. Drivers use it in place of the column
+// list: CREATE INDEX "t_idx" ON "t" USING gin (to_tsvector('simple', "Title")).
+func (k *StructKey) Expression() string {
+	expr := k.Attrs["expression"]
+	if expr == "" {
+		return ""
+	}
+	b := &strings.Builder{}
+	for {
+		start := strings.IndexByte(expr, '{')
+		if start == -1 {
+			break
+		}
+		end := strings.IndexByte(expr[start:], '}')
+		if end == -1 {
+			break
+		}
+		b.WriteString(expr[:start])
+		b.WriteString(QuoteName(expr[start+1 : start+end]))
+		expr = expr[start+end+1:]
+	}
+	b.WriteString(expr)
+	return b.String()
 }
 
 func (k *StructKey) loadKeyName(kn string) {
@@ -168,7 +216,8 @@ func (k *StructKey) genericDefString() string {
 	case KeySpatial:
 		s.WriteString("SPATIAL INDEX ")
 		s.WriteString(QuoteName(k.Key))
-	case KeyVector:
+	case KeyVector, KeyGIN, KeyGIST:
+		// engine-specific: rendered by the driver's KeyRenderer
 		return ""
 	default:
 		return ""
