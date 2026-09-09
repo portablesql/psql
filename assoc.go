@@ -52,14 +52,17 @@ type assocMeta struct {
 	joinTable   string          // many_to_many: join table name
 	joinFK      string          // many_to_many: join table column referencing parent PK
 	joinOtherFK string          // many_to_many: join table column referencing target PK
-	order       []SortValueable // optional ORDER BY for has_many / many_to_many results
-	orderCols   []assocOrderCol // parsed form of order, for Go-side sorting
+	orderCols   []assocOrderCol // optional ORDER BY for has_many / many_to_many results
 }
 
-// assocOrderCol is one column of an order= attribute.
+// assocOrderCol is one column of an order= attribute. parts holds the
+// whitespace-separated words of the entry as given to [S] (the last one is
+// the upper-cased direction when present); col is the first word, resolved
+// through the target's bound view when it names a field.
 type assocOrderCol struct {
-	col  string
-	desc bool
+	parts []string
+	col   string
+	desc  bool
 }
 
 // assocRow is a fetched association target together with the canonical key
@@ -69,16 +72,24 @@ type assocRow struct {
 	val reflect.Value // *T
 }
 
-// assocFetcher is an internal interface implemented by TableMeta[T] for association preloading.
+// assocFetcher is an internal interface implemented by TableMeta[T] for
+// association preloading. Every field it returns comes from the table's view
+// bound to the given backend (see [TableMeta.bind]), so Column is the name
+// used in SQL for that backend.
 type assocFetcher interface {
-	// assocFetchByColumn fetches all rows whose column is in keys, chunking the
-	// IN list according to PreloadChunkSize. Rows are keyed by the canonical
-	// value of column and returned in query order.
-	assocFetchByColumn(ctx context.Context, column string, keys []any, opt *FetchOptions) ([]assocRow, error)
+	// assocFetchByColumn fetches all rows whose column fld is in keys,
+	// chunking the IN list according to PreloadChunkSize. Rows are keyed by
+	// the canonical value of the field and returned in query order.
+	assocFetchByColumn(ctx context.Context, fld *StructField, keys []any, opt *FetchOptions) ([]assocRow, error)
+	// assocMainKey returns the primary/unique key with resolved columns, or nil.
+	assocMainKey(be *Backend) *StructKey
 	// assocPrimaryKeyField returns the single-column primary key field, or nil.
-	assocPrimaryKeyField() *StructField
-	// assocResolveField resolves a Go field name or a column name to a field.
-	assocResolveField(name string) *StructField
+	assocPrimaryKeyField(be *Backend) *StructField
+	// assocResolveField resolves a Go field name, a resolved column name or a
+	// declared column name to a field.
+	assocResolveField(be *Backend, name string) *StructField
+	// assocTableName returns the table name used in SQL for be.
+	assocTableName(be *Backend) string
 	// assocType returns the Go struct type of the table.
 	assocType() reflect.Type
 }
@@ -134,7 +145,7 @@ func PreloadOpts[T any](ctx context.Context, targets []*T, opt *FetchOptions, fi
 			}
 			vals = append(vals, reflect.ValueOf(target).Elem())
 		}
-		if err := assoc.preload(ctx, t.fldcol, t.mainKey, vals, opt); err != nil {
+		if err := assoc.preload(ctx, t, vals, opt); err != nil {
 			return err
 		}
 	}
@@ -185,7 +196,7 @@ func parseAssocTag(tag string, finfo reflect.StructField, index int) *assocMeta 
 		fieldName:  finfo.Name,
 	}
 	if o, ok := attrs["order"]; ok && o != "" {
-		meta.order, meta.orderCols = parseAssocOrder(o)
+		meta.orderCols = parseAssocOrder(o)
 	}
 
 	switch strings.ToLower(parts[0]) {
@@ -220,34 +231,35 @@ func parseAssocTag(tag string, finfo reflect.StructField, index int) *assocMeta 
 		slog.Warn(fmt.Sprintf("[psql] unknown association type %q", parts[0]), "event", "psql:assoc:bad_kind", "field", finfo.Name)
 		return nil
 	}
-	if meta.kind != assocHasMany && meta.kind != assocManyToMany && meta.order != nil {
+	if meta.kind != assocHasMany && meta.kind != assocManyToMany && meta.orderCols != nil {
 		slog.Warn("[psql] order attribute is only supported on has_many and many_to_many associations", "event", "psql:assoc:bad_order", "field", finfo.Name)
-		meta.order, meta.orderCols = nil, nil
+		meta.orderCols = nil
 	}
 	return meta
 }
 
-// parseAssocOrder parses "Col DESC,Other" into sort values and column specs.
-func parseAssocOrder(s string) ([]SortValueable, []assocOrderCol) {
-	var res []SortValueable
+// parseAssocOrder parses "Col DESC,Other" into column specs.
+func parseAssocOrder(s string) []assocOrderCol {
 	var cols []assocOrderCol
 	for _, part := range strings.Split(s, ",") {
 		fields := strings.Fields(part)
 		if len(fields) == 0 {
 			continue
 		}
-		oc := assocOrderCol{col: fields[0]}
+		oc := assocOrderCol{parts: fields, col: fields[0]}
 		if len(fields) > 1 {
 			fields[len(fields)-1] = strings.ToUpper(fields[len(fields)-1])
 			oc.desc = fields[len(fields)-1] == "DESC"
 		}
-		res = append(res, S(fields...))
 		cols = append(cols, oc)
 	}
-	return res, cols
+	return cols
 }
 
-func (a *assocMeta) preload(ctx context.Context, parentFldcol map[string]*StructField, parentKey *StructKey, targets []reflect.Value, opt *FetchOptions) error {
+// preload loads the association on targets, which are addressable values of
+// the parent struct. parent is the parent table; the backend found in ctx
+// selects the bound views (table and column names) of both sides.
+func (a *assocMeta) preload(ctx context.Context, parent assocFetcher, targets []reflect.Value, opt *FetchOptions) error {
 	tableMapL.RLock()
 	targetTable, ok := tableMap[a.targetType]
 	tableMapL.RUnlock()
@@ -259,26 +271,36 @@ func (a *assocMeta) preload(ctx context.Context, parentFldcol map[string]*Struct
 	if !ok {
 		return fmt.Errorf("table for type %s does not support preloading", a.targetType.Name())
 	}
+	be := GetBackend(ctx)
 
 	switch a.kind {
 	case assocBelongsTo:
-		return a.preloadBelongsTo(ctx, parentFldcol, targets, loader, opt)
+		return a.preloadBelongsTo(ctx, be, parent, targets, loader, opt)
 	case assocHasOne, assocHasMany:
-		return a.preloadHas(ctx, parentKey, parentFldcol, targets, loader, opt)
+		return a.preloadHas(ctx, be, parent, targets, loader, opt)
 	case assocManyToMany:
-		return a.preloadManyToMany(ctx, parentKey, parentFldcol, targets, loader, opt)
+		return a.preloadManyToMany(ctx, be, parent, targets, loader, opt)
 	}
 	return nil
 }
 
-// fetchOpt builds the FetchOptions used for target queries.
-func (a *assocMeta) fetchOpt(opt *FetchOptions) *FetchOptions {
+// fetchOpt builds the FetchOptions used for target queries. Order columns
+// naming a field of the target are replaced by the field's column as bound to
+// be; other words (table qualifiers, expressions) are kept as written.
+func (a *assocMeta) fetchOpt(be *Backend, loader assocFetcher, opt *FetchOptions) *FetchOptions {
 	res := &FetchOptions{}
 	if opt != nil {
 		res.WithDeleted = opt.WithDeleted
 	}
-	if len(a.order) > 0 {
-		res.Sort = a.order
+	if len(a.orderCols) > 0 {
+		res.Sort = make([]SortValueable, len(a.orderCols))
+		for i, oc := range a.orderCols {
+			parts := oc.parts
+			if f := loader.assocResolveField(be, oc.col); f != nil && f.Column != oc.col {
+				parts = append([]string{f.Column}, oc.parts[1:]...)
+			}
+			res.Sort[i] = S(parts...)
+		}
 	}
 	return res
 }
@@ -329,25 +351,26 @@ func collectKeys(targets []reflect.Value, fieldIndex int) ([]any, []any) {
 	return keys, perTarget
 }
 
-// parentPKField resolves the parent's single-column primary key field.
-func (a *assocMeta) parentPKField(parentKey *StructKey, parentFldcol map[string]*StructField) (*StructField, error) {
-	if parentKey == nil || len(parentKey.Fields) != 1 || parentKey.Fields[0] == "" {
+// parentPKField resolves the parent's single-column primary key field, bound to be.
+func (a *assocMeta) parentPKField(be *Backend, parent assocFetcher) (*StructField, error) {
+	key := parent.assocMainKey(be)
+	if key == nil || len(key.Fields) != 1 || key.Fields[0] == "" {
 		return nil, fmt.Errorf("association %s: parent must have a single-column primary key for %s (declare it with sql:\",key=PRIMARY\" on the column, or add fields=Column to the psql.Key attributes)", a.fieldName, a.kind)
 	}
-	col := parentKey.Fields[0]
-	f := findFieldByNameOrCol(parentFldcol, col)
+	col := key.Fields[0]
+	f := parent.assocResolveField(be, col)
 	if f == nil {
 		return nil, fmt.Errorf("association %s: parent primary key column %q does not match any struct field (check the fields= attribute of the psql.Key)", a.fieldName, col)
 	}
 	return f, nil
 }
 
-func (a *assocMeta) preloadBelongsTo(ctx context.Context, parentFldcol map[string]*StructField, targets []reflect.Value, loader assocFetcher, opt *FetchOptions) error {
-	fkField := findFieldByNameOrCol(parentFldcol, a.foreignKey)
+func (a *assocMeta) preloadBelongsTo(ctx context.Context, be *Backend, parent assocFetcher, targets []reflect.Value, loader assocFetcher, opt *FetchOptions) error {
+	fkField := parent.assocResolveField(be, a.foreignKey)
 	if fkField == nil {
 		return fmt.Errorf("association %s: foreign key %q not found (expected a Go field name or column name)", a.fieldName, a.foreignKey)
 	}
-	pkField := loader.assocPrimaryKeyField()
+	pkField := loader.assocPrimaryKeyField(be)
 	if pkField == nil {
 		return fmt.Errorf("association %s: target type %s has no single-column primary key", a.fieldName, a.targetType.Name())
 	}
@@ -357,7 +380,7 @@ func (a *assocMeta) preloadBelongsTo(ctx context.Context, parentFldcol map[strin
 		return nil
 	}
 
-	rows, err := loader.assocFetchByColumn(ctx, pkField.Column, keys, a.fetchOpt(opt))
+	rows, err := loader.assocFetchByColumn(ctx, pkField, keys, a.fetchOpt(be, loader, opt))
 	if err != nil {
 		return err
 	}
@@ -381,12 +404,12 @@ func (a *assocMeta) preloadBelongsTo(ctx context.Context, parentFldcol map[strin
 
 // preloadHas handles has_one and has_many: children are fetched by their
 // foreign key column matching the parent primary key.
-func (a *assocMeta) preloadHas(ctx context.Context, parentKey *StructKey, parentFldcol map[string]*StructField, targets []reflect.Value, loader assocFetcher, opt *FetchOptions) error {
-	pkField, err := a.parentPKField(parentKey, parentFldcol)
+func (a *assocMeta) preloadHas(ctx context.Context, be *Backend, parent assocFetcher, targets []reflect.Value, loader assocFetcher, opt *FetchOptions) error {
+	pkField, err := a.parentPKField(be, parent)
 	if err != nil {
 		return err
 	}
-	fkField := loader.assocResolveField(a.foreignKey)
+	fkField := loader.assocResolveField(be, a.foreignKey)
 	if fkField == nil {
 		return fmt.Errorf("association %s: foreign key %q not found on %s (expected a Go field name or column name)", a.fieldName, a.foreignKey, a.targetType.Name())
 	}
@@ -396,7 +419,7 @@ func (a *assocMeta) preloadHas(ctx context.Context, parentKey *StructKey, parent
 		return nil
 	}
 
-	rows, err := loader.assocFetchByColumn(ctx, fkField.Column, keys, a.fetchOpt(opt))
+	rows, err := loader.assocFetchByColumn(ctx, fkField, keys, a.fetchOpt(be, loader, opt))
 	if err != nil {
 		return err
 	}
@@ -422,12 +445,62 @@ func (a *assocMeta) preloadHas(ctx context.Context, parentKey *StructKey, parent
 	return nil
 }
 
-func (a *assocMeta) preloadManyToMany(ctx context.Context, parentKey *StructKey, parentFldcol map[string]*StructField, targets []reflect.Value, loader assocFetcher, opt *FetchOptions) error {
-	pkField, err := a.parentPKField(parentKey, parentFldcol)
+// joinNames returns the join table name and its two foreign key columns as
+// used in SQL for be. When the join table is a registered table (matched by
+// declared name, Go type name or resolved name), its bound view provides the
+// names, so the backend's Namer applies exactly as it did when the table was
+// created and the columns may be given as Go field names. Otherwise the names
+// are explicit SQL names and are used as written, like a psql.Name tag.
+func (a *assocMeta) joinNames(be *Backend) (table, fk, otherFK string, err error) {
+	jt := findTableByName(be, a.joinTable)
+	if jt == nil {
+		return a.joinTable, a.joinFK, a.joinOtherFK, nil
+	}
+	f := jt.assocResolveField(be, a.joinFK)
+	if f == nil {
+		return "", "", "", fmt.Errorf("association %s: join column %q not found on join table %s (expected a Go field name or column name)", a.fieldName, a.joinFK, a.joinTable)
+	}
+	of := jt.assocResolveField(be, a.joinOtherFK)
+	if of == nil {
+		return "", "", "", fmt.Errorf("association %s: join column %q not found on join table %s (expected a Go field name or column name)", a.fieldName, a.joinOtherFK, a.joinTable)
+	}
+	return jt.assocTableName(be), f.Column, of.Column, nil
+}
+
+// findTableByName returns the registered table whose declared name, Go type
+// name or name resolved for be equals name, or nil. Declared names take
+// precedence over Go type names, which take precedence over resolved names.
+func findTableByName(be *Backend, name string) assocFetcher {
+	tableMapL.RLock()
+	defer tableMapL.RUnlock()
+	var byType, byResolved assocFetcher
+	for typ, tm := range tableMap {
+		af, ok := tm.(assocFetcher)
+		if !ok {
+			continue
+		}
+		if tm.Name() == name {
+			return af
+		}
+		if byType == nil && typ.Name() == name {
+			byType = af
+		}
+		if byResolved == nil && af.assocTableName(be) == name {
+			byResolved = af
+		}
+	}
+	if byType != nil {
+		return byType
+	}
+	return byResolved
+}
+
+func (a *assocMeta) preloadManyToMany(ctx context.Context, be *Backend, parent assocFetcher, targets []reflect.Value, loader assocFetcher, opt *FetchOptions) error {
+	pkField, err := a.parentPKField(be, parent)
 	if err != nil {
 		return err
 	}
-	targetPK := loader.assocPrimaryKeyField()
+	targetPK := loader.assocPrimaryKeyField(be)
 	if targetPK == nil {
 		return fmt.Errorf("association %s: target type %s has no single-column primary key", a.fieldName, a.targetType.Name())
 	}
@@ -436,6 +509,10 @@ func (a *assocMeta) preloadManyToMany(ctx context.Context, parentKey *StructKey,
 	}
 	parentType := targets[0].Type()
 	targetType := loader.assocType()
+	joinTable, joinFK, joinOtherFK, err := a.joinNames(be)
+	if err != nil {
+		return err
+	}
 
 	// Collect parent PKs
 	keys, perTarget := collectKeys(targets, pkField.Index)
@@ -453,12 +530,12 @@ func (a *assocMeta) preloadManyToMany(ctx context.Context, parentKey *StructKey,
 	var targetKeys []any
 	for _, chunk := range chunkKeys(keys, PreloadChunkSize) {
 		rows, err := B().
-			Select(a.joinFK, a.joinOtherFK).
-			From(a.joinTable).
-			Where(map[string]any{a.joinFK: chunk}).
+			Select(joinFK, joinOtherFK).
+			From(joinTable).
+			Where(map[string]any{joinFK: chunk}).
 			RunQuery(ctx)
 		if err != nil {
-			return fmt.Errorf("many_to_many join query on %s: %w", a.joinTable, err)
+			return fmt.Errorf("many_to_many join query on %s: %w", joinTable, err)
 		}
 		err = func() error {
 			defer rows.Close()
@@ -502,13 +579,13 @@ func (a *assocMeta) preloadManyToMany(ctx context.Context, parentKey *StructKey,
 	// Fetch target records by PK. Within a single chunk the database order
 	// is authoritative; when the targets span several chunks, ordered
 	// results are re-sorted per parent in Go using the order columns.
-	rows, err := loader.assocFetchByColumn(ctx, targetPK.Column, targetKeys, a.fetchOpt(opt))
+	rows, err := loader.assocFetchByColumn(ctx, targetPK, targetKeys, a.fetchOpt(be, loader, opt))
 	if err != nil {
 		return err
 	}
 	var goSort func(vals []reflect.Value)
 	if len(a.orderCols) > 0 && len(chunkKeys(targetKeys, PreloadChunkSize)) > 1 {
-		goSort, err = a.goSorter(loader)
+		goSort, err = a.goSorter(be, loader)
 		if err != nil {
 			return err
 		}
@@ -541,7 +618,7 @@ func (a *assocMeta) preloadManyToMany(ctx context.Context, parentKey *StructKey,
 		if !ok || len(results) == 0 {
 			continue
 		}
-		if len(a.order) > 0 {
+		if len(a.orderCols) > 0 {
 			sort.SliceStable(results, func(x, y int) bool { return results[x].pos < results[y].pos })
 		}
 		vals := make([]reflect.Value, len(results))
@@ -558,14 +635,14 @@ func (a *assocMeta) preloadManyToMany(ctx context.Context, parentKey *StructKey,
 
 // goSorter returns a function sorting fetched *T values by the association's
 // order columns, used when results come from several chunked queries.
-func (a *assocMeta) goSorter(loader assocFetcher) (func(vals []reflect.Value), error) {
+func (a *assocMeta) goSorter(be *Backend, loader assocFetcher) (func(vals []reflect.Value), error) {
 	type key struct {
 		idx  int
 		desc bool
 	}
 	keys := make([]key, len(a.orderCols))
 	for i, oc := range a.orderCols {
-		f := loader.assocResolveField(oc.col)
+		f := loader.assocResolveField(be, oc.col)
 		if f == nil {
 			return nil, fmt.Errorf("association %s: order column %q not found on %s", a.fieldName, oc.col, a.targetType.Name())
 		}
@@ -682,18 +759,6 @@ func chunkKeys(keys []any, n int) [][]any {
 	return res
 }
 
-func findFieldByNameOrCol(fldcol map[string]*StructField, name string) *StructField {
-	if f, ok := fldcol[name]; ok {
-		return f
-	}
-	for _, f := range fldcol {
-		if f.Name == name {
-			return f
-		}
-	}
-	return nil
-}
-
 var (
 	assocTimeType   = reflect.TypeFor[time.Time]()
 	assocValuerType = reflect.TypeFor[driver.Valuer]()
@@ -790,14 +855,13 @@ func canonicalRaw(v reflect.Value) any {
 
 // assocFetcher implementation on TableMeta
 
-func (t *TableMeta[T]) assocFetchByColumn(ctx context.Context, column string, keys []any, opt *FetchOptions) ([]assocRow, error) {
-	fld, ok := t.fldcol[column]
-	if !ok {
-		return nil, fmt.Errorf("column %q not found in table %s", column, t.table)
+func (t *TableMeta[T]) assocFetchByColumn(ctx context.Context, fld *StructField, keys []any, opt *FetchOptions) ([]assocRow, error) {
+	if fld == nil {
+		return nil, fmt.Errorf("no column given for table %s", t.table)
 	}
 	var rows []assocRow
 	for _, chunk := range chunkKeys(keys, PreloadChunkSize) {
-		results, err := t.Fetch(ctx, map[string]any{column: chunk}, opt)
+		results, err := t.Fetch(ctx, map[string]any{fld.Column: chunk}, opt)
 		if err != nil {
 			return nil, err
 		}
@@ -813,15 +877,46 @@ func (t *TableMeta[T]) assocFetchByColumn(ctx context.Context, column string, ke
 	return rows, nil
 }
 
-func (t *TableMeta[T]) assocPrimaryKeyField() *StructField {
-	if t.mainKey == nil || len(t.mainKey.Fields) != 1 || t.mainKey.Fields[0] == "" {
-		return nil
+// boundField finds a field of t in the bound view bt by its resolved column
+// name, its declared column name or its Go field name. The returned field is
+// always the bound one, so its Column is the name used in SQL for bt's backend.
+func (t *TableMeta[T]) boundField(bt *boundTable, name string) *StructField {
+	if f, ok := bt.fldcol[name]; ok {
+		return f
 	}
-	return findFieldByNameOrCol(t.fldcol, t.mainKey.Fields[0])
+	if f, ok := t.fldcol[name]; ok {
+		for _, bf := range bt.fields {
+			if bf.Index == f.Index {
+				return bf
+			}
+		}
+	}
+	for _, f := range bt.fields {
+		if f.Name == name {
+			return f
+		}
+	}
+	return nil
 }
 
-func (t *TableMeta[T]) assocResolveField(name string) *StructField {
-	return findFieldByNameOrCol(t.fldcol, name)
+func (t *TableMeta[T]) assocMainKey(be *Backend) *StructKey {
+	return t.bind(be).mainKey
+}
+
+func (t *TableMeta[T]) assocPrimaryKeyField(be *Backend) *StructField {
+	bt := t.bind(be)
+	if bt.mainKey == nil || len(bt.mainKey.Fields) != 1 || bt.mainKey.Fields[0] == "" {
+		return nil
+	}
+	return t.boundField(bt, bt.mainKey.Fields[0])
+}
+
+func (t *TableMeta[T]) assocResolveField(be *Backend, name string) *StructField {
+	return t.boundField(t.bind(be), name)
+}
+
+func (t *TableMeta[T]) assocTableName(be *Backend) string {
+	return t.bind(be).name
 }
 
 func (t *TableMeta[T]) assocType() reflect.Type {

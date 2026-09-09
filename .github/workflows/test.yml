@@ -5,24 +5,84 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  unit:
-    name: Unit Tests
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
-      - run: go test -v -count=1 ./...
+          go-version: stable
+          check-latest: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "files not formatted:"; echo "$out"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
-  coverage:
-    name: Coverage
+  unit:
+    name: Unit Tests (Go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - run: go test -race -count=1 ./...
+
+  integration:
+    # Runs the psql-test integration suite against this checkout of psql,
+    # using a go.work with master checkouts of psql-test and the three drivers
+    # (their go.mod files pin released psql versions, which the workspace
+    # overrides). Coverage is collected for github.com/portablesql/psql/...
+    # from each backend, merged and uploaded to Coveralls.
+    #
+    # psql-pgsql and psql-sqlite require go >= 1.25, so this job uses the
+    # stable toolchain rather than the 1.24 minimum used by the unit job.
+    name: Integration (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, mysql, postgres]
+        include:
+          - backend: sqlite
+            dsn: ""
+          - backend: mysql
+            dsn: "root:test@tcp(127.0.0.1:3306)/psql_test"
+          - backend: postgres
+            dsn: "postgres://test:test@localhost:5432/psql_test?sslmode=disable"
     services:
+      # Both services are declared for every matrix entry; GitHub does not
+      # allow conditional services. They are cheap and health-checked.
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -30,10 +90,10 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U test -d psql_test"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
       mysql:
         image: mysql:8
         env:
@@ -42,7 +102,7 @@ jobs:
         ports:
           - 3306:3306
         options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1"
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ptest"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -53,32 +113,90 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: portablesql/psql-test
+          ref: master
           path: psql-test
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql-mysql
+          ref: master
+          path: psql-mysql
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql-pgsql
+          ref: master
+          path: psql-pgsql
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql-sqlite
+          ref: master
+          path: psql-sqlite
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: stable
+          check-latest: true
+          cache-dependency-path: |
+            psql/go.sum
+            psql-test/go.sum
+            psql-mysql/go.sum
+            psql-pgsql/go.sum
+            psql-sqlite/go.sum
       - name: Setup workspace
-        run: go work init ./psql ./psql-test
+        run: go work init ./psql ./psql-test ./psql-mysql ./psql-pgsql ./psql-sqlite
+      - name: Build psql-test
+        working-directory: psql-test
+        run: go build ./... && go vet ./...
+      - name: Enable pgvector
+        # The tests run CREATE EXTENSION themselves and skip vector tests when
+        # it fails; doing it here as well makes a missing extension a hard
+        # failure instead of a silent skip.
+        if: matrix.backend == 'postgres'
+        run: psql -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector'
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: test
+          PGPASSWORD: test
+          PGDATABASE: psql_test
+      - name: Unit tests (coverage)
+        if: matrix.backend == 'sqlite'
+        working-directory: psql
+        run: go test -count=1 -coverprofile=cover-unit.out -covermode=atomic -coverpkg=github.com/portablesql/psql/... ./...
+      - name: Integration tests
+        working-directory: psql-test
+        run: go test -count=1 -coverprofile=cover-${{ matrix.backend }}.out -covermode=atomic -coverpkg=github.com/portablesql/psql/... ./...
+        env:
+          PSQL_TEST_DSN: ${{ matrix.dsn }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.backend }}
+          path: |
+            psql/cover-unit.out
+            psql-test/cover-${{ matrix.backend }}.out
+          if-no-files-found: error
+          retention-days: 1
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: integration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: cov
+          merge-multiple: true
       - name: Install gocovmerge
         run: go install github.com/wadey/gocovmerge@latest
-      - name: Unit tests
-        working-directory: psql
-        run: go test -coverprofile=cover-unit.out -covermode=atomic -coverpkg=github.com/portablesql/psql/... ./...
-      - name: Integration tests (SQLite)
-        working-directory: psql-test
-        run: go test -coverprofile=cover-sqlite.out -covermode=atomic -coverpkg=github.com/portablesql/psql/... ./...
-      - name: Integration tests (PostgreSQL)
-        working-directory: psql-test
-        run: go test -coverprofile=cover-pgsql.out -covermode=atomic -coverpkg=github.com/portablesql/psql/... ./...
-        env:
-          PSQL_TEST_DSN: "postgres://test:test@localhost:5432/psql_test?sslmode=disable"
-      - name: Integration tests (MySQL)
-        working-directory: psql-test
-        run: go test -coverprofile=cover-mysql.out -covermode=atomic -coverpkg=github.com/portablesql/psql/... ./...
-        env:
-          PSQL_TEST_DSN: "root:test@tcp(127.0.0.1:3306)/psql_test"
       - name: Merge coverage
-        run: gocovmerge psql/cover-unit.out psql-test/cover-sqlite.out psql-test/cover-pgsql.out psql-test/cover-mysql.out > coverage.out
+        run: |
+          ls -R cov
+          gocovmerge $(find cov -name '*.out' | sort) > coverage.out
+          go tool cover -func=coverage.out | tail -1
       - name: Send to Coveralls
         uses: coverallsapp/github-action@v2
         with:

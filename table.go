@@ -60,7 +60,6 @@ type TableMeta[T any] struct {
 	fldStr       string // string of all fields
 	state        int
 	attrs        map[string]string
-	futures      sync.Map
 	assocs       map[string]*assocMeta // association metadata by Go field name
 	softDelete   *StructField          // non-nil if soft delete is enabled
 	views        sync.Map              // *Backend → *boundTable (names resolved by the backend's Namer)

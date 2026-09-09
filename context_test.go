@@ -16,6 +16,7 @@ func TestGetBackendDefault(t *testing.T) {
 }
 
 func TestGetBackendNilCtx(t *testing.T) {
+	//lint:ignore SA1012 exercising nil-context handling on purpose
 	be := psql.GetBackend(nil)
 	// DefaultBackend is nil in test environment without a database
 	_ = be

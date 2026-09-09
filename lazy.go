@@ -265,10 +265,12 @@ func (f *Future[T]) Resolve(ctx context.Context) (*T, error) {
 	return f.obj, f.err
 }
 
-// lazyField returns the column's field and pointer-stripped Go type, or nil
-// if the column is unknown.
-func (f *Future[T]) lazyField() (*StructField, reflect.Type) {
-	fld := findFieldByNameOrCol(f.table.fldcol, f.col)
+// lazyField returns the column's field, bound to be so that its Column is the
+// name used in SQL, and its pointer-stripped Go type. The column of a future
+// may be given as a Go field name, a declared column name or a resolved column
+// name. It returns nil if the column is unknown.
+func (f *Future[T]) lazyField(be *Backend) (*StructField, reflect.Type) {
+	fld := f.table.boundField(f.table.bind(be), f.col)
 	if fld == nil {
 		return nil, nil
 	}
@@ -325,7 +327,7 @@ func (f *Future[T]) normalize(fld *StructField, typ reflect.Type) bool {
 func (f *Future[T]) resolve(ctx context.Context) {
 	be := GetBackend(ctx)
 	scope := f.scope
-	fld, typ := f.lazyField()
+	fld, typ := f.lazyField(be)
 	batchable := lazyBatchable(typ)
 
 	scope.mu.Lock()
@@ -368,7 +370,11 @@ func (f *Future[T]) resolve(ctx context.Context) {
 	scope.mu.Unlock()
 
 	if !batchable {
-		f.finish(f.table.Get(ctx, map[string]any{f.col: f.val}))
+		col := f.col
+		if fld != nil {
+			col = fld.Column
+		}
+		f.finish(f.table.Get(ctx, map[string]any{col: f.val}))
 		return
 	}
 	f.runBatch(ctx, fld, append([]*Future[T]{f}, peers...))
@@ -382,7 +388,8 @@ func (f *Future[T]) finish(obj *T, err error) {
 }
 
 // runBatch fetches all rows for the given futures (all claimed, normalized,
-// same column) and distributes the results.
+// same column) and distributes the results. fld is the column's field bound
+// to the backend of ctx.
 func (f *Future[T]) runBatch(ctx context.Context, fld *StructField, all []*Future[T]) {
 	// Deduplicate query arguments by canonical key.
 	seen := make(map[any]struct{}, len(all))
@@ -402,7 +409,7 @@ func (f *Future[T]) runBatch(ctx context.Context, fld *StructField, all []*Futur
 	}
 	var rows []*row
 	for _, chunk := range chunkKeys(args, PreloadChunkSize) {
-		results, err := f.table.Fetch(ctx, map[string]any{f.col: chunk})
+		results, err := f.table.Fetch(ctx, map[string]any{fld.Column: chunk})
 		if err != nil {
 			for _, p := range all {
 				p.finish(nil, err)
@@ -477,7 +484,7 @@ func (f *Future[T]) runBatch(ctx context.Context, fld *StructField, all []*Futur
 	}
 	if len(unused) > 0 {
 		for _, p := range pending {
-			p.finish(f.table.Get(ctx, map[string]any{f.col: p.arg}))
+			p.finish(f.table.Get(ctx, map[string]any{fld.Column: p.arg}))
 		}
 		return
 	}
@@ -490,7 +497,11 @@ func (f *Future[T]) runBatch(ctx context.Context, fld *StructField, all []*Futur
 // and marshals the record. It returns [ErrNotReady] when no backend is
 // available, and [os.ErrNotExist] when the record does not exist.
 func (f *Future[T]) MarshalJSON() ([]byte, error) {
-	v, err := f.Resolve(nil)
+	ctx := f.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	v, err := f.Resolve(ctx)
 	if err != nil {
 		return nil, err
 	}

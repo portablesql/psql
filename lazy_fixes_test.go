@@ -24,6 +24,7 @@ func TestLazyFixesNoBackendReturnsErrNotReady(t *testing.T) {
 	defer func() { psql.DefaultBackend = saved }()
 
 	f := psql.Lazy[lfUser]("ID", "1")
+	//lint:ignore SA1012 exercising nil-context handling
 	_, err := f.Resolve(nil)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, psql.ErrNotReady), "got %v", err)
@@ -39,6 +40,7 @@ func TestLazyFixesNoBackendReturnsErrNotReady(t *testing.T) {
 	assert.True(t, errors.Is(err, psql.ErrNotReady), "got %v", err)
 
 	// A future created with LazyCtx keeps its context but that context has no backend either.
+	//lint:ignore SA1012 exercising nil-context handling
 	_, err = psql.LazyCtx[lfUser](context.Background(), "ID", "1").Resolve(nil)
 	assert.True(t, errors.Is(err, psql.ErrNotReady), "got %v", err)
 }
