@@ -1,7 +1,5 @@
-github.com/KarpelesLab/pjson v0.1.10 h1:ZZcRvHj3fjY/fnYQ+Zow9SCZDOGYTkXs/0v0qtOgv3A=
-github.com/KarpelesLab/pjson v0.1.10/go.mod h1:gb4uSTld7I2kO2WvLdat1mN1brsS1hzSR+dWw1hL3iU=
-github.com/KarpelesLab/typutil v0.2.34 h1:9ZI5uwcZxQlb6klwn5JlNK95fnkEk001ii6+jBm0M3Y=
-github.com/KarpelesLab/typutil v0.2.34/go.mod h1:8QWuhh8zAkTt+AszMeENIYZJC4JQtk+Ib0yLlSqLLyY=
+github.com/KarpelesLab/typutil v0.3.0 h1:MFzVQmBUJha/sICYnERGz0wKKHp1+ovNIRmig1fdc24=
+github.com/KarpelesLab/typutil v0.3.0/go.mod h1:VyVrSJoOBybuqr2eSE5rAEfPnZZS/UHDGhxv7B3F4JI=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

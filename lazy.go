@@ -3,14 +3,14 @@ package psql
 import (
 	"context"
 	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"weak"
-
-	"github.com/KarpelesLab/pjson"
 )
 
 // Future represents a lazily-loaded database record. Created by [Lazy] or
@@ -27,7 +27,7 @@ import (
 // context (or none yet), so batches never cross tenants or transactions.
 //
 // Concurrent Resolve calls share the same result. Future also implements
-// json.Marshaler and the pjson context-aware marshaler.
+// json.Marshaler and MarshalContextJSON, see [JSONOptions].
 type Future[T any] struct {
 	col   string
 	val   string
@@ -501,20 +501,37 @@ func (f *Future[T]) MarshalJSON() ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	v, err := f.Resolve(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return pjson.Marshal(v)
+	return f.MarshalContextJSON(ctx)
 }
 
-// MarshalContextJSON resolves the future using ctx and marshals the record.
-// It is used by pjson.MarshalContext so that a whole response can be encoded
-// against the request's backend or transaction.
+// MarshalContextJSON resolves the future using ctx and marshals the record, so
+// a whole response can be encoded against the request's backend or
+// transaction. encoding/json/v2 reaches it through [JSONOptions].
 func (f *Future[T]) MarshalContextJSON(ctx context.Context) ([]byte, error) {
 	v, err := f.Resolve(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return pjson.Marshal(v)
+	return json.Marshal(v)
+}
+
+// ContextMarshaler is implemented by values whose JSON form depends on the
+// context they are encoded under, such as [Future].
+type ContextMarshaler interface {
+	MarshalContextJSON(context.Context) ([]byte, error)
+}
+
+// JSONOptions returns encoding/json/v2 options that encode every
+// [ContextMarshaler] in a value with ctx, in place of the context-less
+// MarshalJSON it would otherwise fall back to:
+//
+//	buf, err := json.Marshal(response, psql.JSONOptions(ctx))
+func JSONOptions(ctx context.Context) json.Options {
+	return json.WithMarshalers(json.MarshalToFunc(func(enc *jsontext.Encoder, m ContextMarshaler) error {
+		buf, err := m.MarshalContextJSON(ctx)
+		if err != nil {
+			return err
+		}
+		return enc.WriteValue(buf)
+	}))
 }

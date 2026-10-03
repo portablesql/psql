@@ -93,7 +93,7 @@ case errors.Is(err, psql.ErrNotReady): // no backend available
   result. A resolved future returns its cached result (or error) forever.
 - Soft-deleted rows are not found.
 - `Future[T]` implements `json.Marshaler` (resolving with a nil context) and
-  `MarshalContextJSON` for `pjson.MarshalContext`, so a future in a response
+  `MarshalContextJSON`, reached through `psql.JSONOptions(ctx)` with encoding/json/v2, so a future in a response
   struct is expanded to the record when encoded:
 
 ```go

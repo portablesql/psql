@@ -1,10 +1,9 @@
 module github.com/portablesql/psql
 
-go 1.24.0
+go 1.27
 
 require (
-	github.com/KarpelesLab/pjson v0.1.10
-	github.com/KarpelesLab/typutil v0.2.34
+	github.com/KarpelesLab/typutil v0.3.0
 	github.com/stretchr/testify v1.8.1
 )
 
